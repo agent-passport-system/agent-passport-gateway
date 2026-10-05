@@ -74,8 +74,10 @@ before, and the request approved on the revoked approver's signature.
 - No approvers are registered for any tenant. Until a tenant admin registers one,
   `/sign` answers `403 approver_not_registered`.
 - Pending requests signed before this change hold signatures that were never verified.
-  Approving them answers `409 approver_evidence_invalid`, and they need re-signing by a
-  registered approver.
+  Approving them answers `409 approver_evidence_invalid`. A new signature from a
+  registered approver does not change that, because the unverified rows stay on the
+  request. Reject such a request or let it expire, then open a new one. Pending
+  requests with no signatures can be signed and approved normally.
 - Approval receipts issued from now on use payload schema `1.1.0` with
   `request_commitment` and `approver_evidence_digest`. Both are in the full receipt on
   the authenticated `GET /api/v1/approvals/:id/receipt` and are not in the public
