@@ -542,7 +542,7 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
   let verified: Array<{ approver_id: string; key_id: string; signature: string }> = []
   let invalid = 0
   const now = new Date().toISOString()
-  const { row, error } = decideRequest({
+  const { row, error, decidedAt } = decideRequest({
     tenantId: tenant.id, id: req.params.id, verdict,
     reason, decidedBy: decided_by, nowIso: now,
     expectedCommitmentDigest: commitment.digest,
@@ -611,7 +611,7 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
     requestCommitment: commitment.digest,
     approverEvidenceDigest: approverEvidenceDigest(commitment.digest, verified),
     sampled: !!sample && sample.sampled === 1,
-    issuedAt: now,
+    issuedAt: decidedAt as string,
   })
 
   // Wave 2 SET emission seam (stub). In-band SSE event is emitted below.

@@ -217,6 +217,13 @@ export function listRequests(tenantId: string, status?: string, limit = 50): App
  *  the approver registry under the write lock, so an approver revocation
  *  committed by another connection either lands before the read (and is
  *  seen) or waits until the decision has committed.
+ *  nowIso is the caller's clock from before the lock and only serves the
+ *  early expiry refusal. The decision time is read from the server clock
+ *  after checkInTx, immediately before the UPDATE: an approval whose
+ *  request expired while this call waited for the write lock, or while
+ *  the checks above ran, is refused as 'expired'. That same instant is
+ *  written as decided_at (approve and reject) and returned as decidedAt
+ *  for the receipt.
  *  Returns the updated row or null with an error code. */
 export function decideRequest(opts: {
   tenantId: string
@@ -228,7 +235,7 @@ export function decideRequest(opts: {
   expectedCommitmentDigest?: string
   commitmentOf?: (row: ApprovalRequestRow) => string
   checkInTx?: (row: ApprovalRequestRow) => string | null
-}): { row: ApprovalRequestRow | null; error?: string } {
+}): { row: ApprovalRequestRow | null; error?: string; decidedAt?: string } {
   const db = getDB()
   return db.transaction(() => {
     const row = db.prepare(
@@ -245,15 +252,17 @@ export function decideRequest(opts: {
       const err = opts.checkInTx(row)
       if (err) return { row, error: err }
     }
+    const decidedAt = new Date().toISOString()
+    if (opts.verdict === 'approved' && row.expires_at <= decidedAt) return { row, error: 'expired' }
     db.prepare(`
       UPDATE approval_requests
       SET status = ?, decision_reason = ?, decided_by = ?, decided_at = ?
       WHERE tenant_id = ? AND id = ? AND status = 'pending'
-    `).run(opts.verdict, opts.reason, opts.decidedBy, opts.nowIso, opts.tenantId, opts.id)
+    `).run(opts.verdict, opts.reason, opts.decidedBy, decidedAt, opts.tenantId, opts.id)
     const updated = db.prepare(
       `SELECT * FROM approval_requests WHERE tenant_id = ? AND id = ?`
     ).get(opts.tenantId, opts.id) as ApprovalRequestRow
-    return { row: updated }
+    return { row: updated, decidedAt }
   }).immediate()
 }
 
