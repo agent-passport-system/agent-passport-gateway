@@ -565,3 +565,91 @@ describe('unbindable fields', () => {
     assert.equal(getRequest(TENANT, id)!.status, 'pending')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Request content fixed at open is refused on /sign and /decide by name
+// ─────────────────────────────────────────────────────────────────────
+
+describe('sign and decide - request-bound body fields are refused', () => {
+  const cases: Array<[string, unknown]> = [
+    ['subject', 'attacker-invoice'],
+    ['action_class', 'read:noop'],
+    ['requested_scope', ['payments:*']],
+  ]
+  const signatureCount = (id: string) =>
+    (getDB().prepare(`SELECT COUNT(*) c FROM approval_signatures WHERE request_id = ?`).get(id) as any).c as number
+
+  // Two requests shared by every case (the open route is rate limited per
+  // tenant). A refused call must leave each one exactly as it was, which the
+  // last test relies on: the unsigned one is then signed and approved.
+  let a: { id: string; kp: Kp }
+  let unsignedId: string
+  let signedId: string
+  before(async () => {
+    a = approver(['payments:*'])
+    unsignedId = await open(); backdate(unsignedId)
+    signedId = await open(); backdate(signedId)
+    const s = await call('POST', `/approvals/${signedId}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(signedId, a.kp) })
+    assert.equal(s.status, 201, JSON.stringify(s.json))
+  })
+
+  for (const [field, value] of cases) {
+    it(`${field} in a /sign body is 400 request_bound_field and stores nothing`, async () => {
+      const before = getRequest(TENANT, unsignedId)!
+      const r = await call('POST', `/approvals/${unsignedId}/sign`, {
+        approver_id: a.id, reason: 'reviewed it', signature: sigFor(unsignedId, a.kp), [field]: value,
+      })
+      assert.equal(r.status, 400)
+      assert.equal(r.json.code, 'request_bound_field')
+      assert.deepEqual(r.json.fields, [field])
+      assert.equal(signatureCount(unsignedId), 0)
+      assert.equal(getApprovalHistory(a.id).length, 0)
+      assert.deepEqual(getRequest(TENANT, unsignedId), before)
+    })
+
+    for (const verdict of ['approved', 'rejected']) {
+      it(`${field} in a /decide ${verdict} body is 400 request_bound_field and stores nothing`, async () => {
+        const before = getRequest(TENANT, signedId)!
+        const d = await call('POST', `/approvals/${signedId}/decide`, {
+          verdict, reason: 'looks right', decided_by: 'ops', [field]: value,
+        })
+        assert.equal(d.status, 400)
+        assert.equal(d.json.code, 'request_bound_field')
+        assert.deepEqual(d.json.fields, [field])
+        assert.deepEqual(getRequest(TENANT, signedId), before)
+        assert.equal(before.status, 'pending')
+        assert.equal(receiptCount(signedId), 0)
+        assert.equal(signatureCount(signedId), 1)
+      })
+    }
+  }
+
+  it('all three together are named in one 400 on each route', async () => {
+    const all = Object.fromEntries(cases)
+    const s = await call('POST', `/approvals/${unsignedId}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(unsignedId, a.kp), ...all })
+    assert.equal(s.status, 400)
+    assert.equal(s.json.code, 'request_bound_field')
+    assert.deepEqual(s.json.fields, cases.map(c => c[0]))
+    const d = await call('POST', `/approvals/${signedId}/decide`, { verdict: 'approved', reason: 'looks right', decided_by: 'ops', ...all })
+    assert.equal(d.status, 400)
+    assert.equal(d.json.code, 'request_bound_field')
+    assert.deepEqual(d.json.fields, cases.map(c => c[0]))
+    assert.equal(signatureCount(unsignedId), 0)
+    assert.equal(receiptCount(signedId), 0)
+  })
+
+  it('a valid sign and decide without them still succeed and the receipt carries the stored values', async () => {
+    const stored = getRequest(TENANT, unsignedId)!
+    const s = await call('POST', `/approvals/${unsignedId}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(unsignedId, a.kp) })
+    assert.equal(s.status, 201, JSON.stringify(s.json))
+    const d = await call('POST', `/approvals/${unsignedId}/decide`, { verdict: 'approved', reason: 'looks right', decided_by: 'ops' })
+    assert.equal(d.status, 200, JSON.stringify(d.json))
+    assert.equal(receiptCount(unsignedId), 1)
+    const p = (await call('GET', `/approvals/${unsignedId}/receipt`)).json.payload
+    assert.equal(p.subject, stored.subject)
+    assert.equal(p.action_class, stored.action_class)
+    const d2 = await call('POST', `/approvals/${signedId}/decide`, { verdict: 'approved', reason: 'looks right', decided_by: 'ops' })
+    assert.equal(d2.status, 200, JSON.stringify(d2.json))
+    assert.equal(receiptCount(signedId), 1)
+  })
+})

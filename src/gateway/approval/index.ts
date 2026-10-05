@@ -145,6 +145,22 @@ const SERVER_BOUND_SIGN_FIELDS = [
   'batch_size',
 ] as const
 
+/** Request content fixed at open. The commitment an approver signs and the
+ *  receipt both come from the stored row, so these in a /sign or /decide
+ *  body could never change what is approved. They are refused rather than
+ *  silently ignored, so a caller cannot believe it changed them. */
+const REQUEST_BOUND_FIELDS = ['subject', 'action_class', 'requested_scope'] as const
+
+function rejectRequestBound(body: any, res: any): boolean {
+  const present = REQUEST_BOUND_FIELDS.filter(f => body && Object.prototype.hasOwnProperty.call(body, f))
+  if (present.length === 0) return false
+  res.status(400).json({
+    error: `Fields fixed when the request was opened: ${present.join(', ')}. Open a new request to change them.`,
+    code: 'request_bound_field', fields: present,
+  })
+  return true
+}
+
 function rejectServerBound(body: any, res: any): boolean {
   const present = SERVER_BOUND_SIGN_FIELDS.filter(f => body && Object.prototype.hasOwnProperty.call(body, f))
   if (present.length === 0) return false
@@ -345,7 +361,9 @@ approvalRouter.get('/approvals/:id', (req: any, res) => {
 // office come from the registry. approver_public_key, authority, key_class,
 // office_id, decision_latency_ms and batch_size in the body are refused
 // with 400 server_bound_field. One /sign call carries one signature over
-// one request commitment, so the batch is always 1.
+// one request commitment, so the batch is always 1. subject, action_class
+// and requested_scope are fixed at open and refused with 400
+// request_bound_field (also on /decide).
 // The signature must verify under the registered key over the request
 // commitment (commitment.ts). Then the scoped-authority gate: authority
 // match; for high-risk tiers the approver must be independent of the
@@ -371,6 +389,7 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
 
   if (rejectUnbindable(req.body, res)) return
   if (rejectServerBound(req.body, res)) return
+  if (rejectRequestBound(req.body, res)) return
   const { approver_id, reason, signature } = req.body || {}
 
   if (!approver_id || !reason) {
@@ -493,6 +512,7 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
   sweepExpired(tenant.id)
 
   if (rejectUnbindable(req.body, res)) return
+  if (rejectRequestBound(req.body, res)) return
   const { verdict, reason, decided_by } = req.body || {}
   if (verdict !== 'approved' && verdict !== 'rejected') {
     return res.status(400).json({ error: 'verdict must be "approved" or "rejected"' })

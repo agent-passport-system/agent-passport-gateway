@@ -11,6 +11,14 @@ them, so a caller could believe an amount or a payee had been approved when only
 action class and `requested_scope` were. Encode limits in `requested_scope` instead.
 `estimated_total` (the advisory value gate at open) is unchanged.
 
+**BREAKING: `/sign` and `/decide` refuse request content.** `subject`, `action_class` and
+`requested_scope` in a `POST /api/v1/approvals/:id/sign` or `/decide` body answer
+`400 {code: "request_bound_field", fields: [...]}` and nothing is stored. Before, they
+were accepted and ignored: the signed commitment and the receipt always came from the
+request as opened, so they could not change what was approved, but a caller could
+believe they had. Open a new request to change them. `POST /api/v1/approvals` still
+takes all three.
+
 **BREAKING: `/sign` takes `approver_id`, `reason` and `signature` only.**
 
 - `approver_id` must name an approver the tenant admin registered (below). Its public
