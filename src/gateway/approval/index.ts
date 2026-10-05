@@ -505,43 +505,55 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
   const existing = getRequest(tenant.id, req.params.id)
   if (!existing) return res.status(404).json({ error: 'Approval request not found' })
 
+  // Approver evidence is checked inside decideRequest's IMMEDIATE
+  // transaction (checkInTx), not before it. The store is a SQLite file in
+  // WAL mode that more than one process can open, so an approver
+  // revocation committed by another connection between a check here and
+  // the decision commit would otherwise go unseen. Under the write lock it
+  // either landed before the reads below or waits for this commit.
+  //
   // On approve, require at least one collected signature - an approval with
   // zero approver signatures is a rubber-stamp button, which this module
-  // exists to refuse.
-  const sigs = getSignatures(tenant.id, req.params.id)
-  if (verdict === 'approved' && sigs.length === 0) {
-    return res.status(409).json({ error: 'Cannot approve with zero approver signatures' })
-  }
-
-  // Re-verify every stored signature against the commitment of the row as
-  // it is NOW, under the approver's current registry key. A row changed
-  // after signing, or a revoked or re-keyed approver, fails here.
+  // exists to refuse. Every stored signature is re-verified against the
+  // commitment of the row as it is NOW, under the approver's current
+  // registry key. A row changed after signing, or a revoked or re-keyed
+  // approver, fails here.
   const commitment = approvalCommitment(existing)
-  const verified: Array<{ approver_id: string; key_id: string; signature: string }> = []
+  let verified: Array<{ approver_id: string; key_id: string; signature: string }> = []
   let invalid = 0
-  for (const s of sigs) {
-    const reg = getActiveApprover(tenant.id, s.approver_id)
-    if (reg && reg.public_key === s.approver_public_key
-        && verifyApproverSignature(commitment, s.signature, reg.public_key)) {
-      verified.push({ approver_id: s.approver_id, key_id: approverKeyId(reg.public_key), signature: s.signature })
-    } else {
-      invalid++
-    }
-  }
-  if (verdict === 'approved' && invalid > 0) {
-    return res.status(409).json({
-      error: 'Approver evidence does not verify against the current request content',
-      code: 'approver_evidence_invalid', invalid_signatures: invalid,
-    })
-  }
-
   const now = new Date().toISOString()
   const { row, error } = decideRequest({
     tenantId: tenant.id, id: req.params.id, verdict,
     reason, decidedBy: decided_by, nowIso: now,
     expectedCommitmentDigest: commitment.digest,
     commitmentOf: (r) => approvalCommitment(r).digest,
+    checkInTx: (r) => {
+      const sigs = getSignatures(tenant.id, r.id)
+      if (verdict === 'approved' && sigs.length === 0) return 'no_signatures'
+      verified = []
+      invalid = 0
+      for (const s of sigs) {
+        const reg = getActiveApprover(tenant.id, s.approver_id)
+        if (reg && reg.public_key === s.approver_public_key
+            && verifyApproverSignature(commitment, s.signature, reg.public_key)) {
+          verified.push({ approver_id: s.approver_id, key_id: approverKeyId(reg.public_key), signature: s.signature })
+        } else {
+          invalid++
+        }
+      }
+      if (verdict === 'approved' && invalid > 0) return 'evidence_invalid'
+      return null
+    },
   })
+  if (error === 'no_signatures') {
+    return res.status(409).json({ error: 'Cannot approve with zero approver signatures' })
+  }
+  if (error === 'evidence_invalid') {
+    return res.status(409).json({
+      error: 'Approver evidence does not verify against the current request content',
+      code: 'approver_evidence_invalid', invalid_signatures: invalid,
+    })
+  }
   if (error === 'not_found') return res.status(404).json({ error: 'Approval request not found' })
   if (error === 'expired') {
     // Expiry wins over a late decision. Surface it and emit.

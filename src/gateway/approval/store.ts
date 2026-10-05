@@ -211,6 +211,12 @@ export function listRequests(tenantId: string, status?: string, limit = 50): App
  *  expectedCommitmentDigest are given, the row read inside the transaction
  *  must still produce that commitment, so the content the approvers'
  *  signatures were verified against is the content being decided.
+ *  checkInTx, when given, runs inside the same IMMEDIATE transaction after
+ *  those checks and before the UPDATE; a non-null return is the error code
+ *  and nothing is written. The caller uses it to read the signatures and
+ *  the approver registry under the write lock, so an approver revocation
+ *  committed by another connection either lands before the read (and is
+ *  seen) or waits until the decision has committed.
  *  Returns the updated row or null with an error code. */
 export function decideRequest(opts: {
   tenantId: string
@@ -221,6 +227,7 @@ export function decideRequest(opts: {
   nowIso: string
   expectedCommitmentDigest?: string
   commitmentOf?: (row: ApprovalRequestRow) => string
+  checkInTx?: (row: ApprovalRequestRow) => string | null
 }): { row: ApprovalRequestRow | null; error?: string } {
   const db = getDB()
   return db.transaction(() => {
@@ -233,6 +240,10 @@ export function decideRequest(opts: {
     if (opts.expectedCommitmentDigest !== undefined && opts.commitmentOf
         && opts.commitmentOf(row) !== opts.expectedCommitmentDigest) {
       return { row, error: 'commitment_mismatch' }
+    }
+    if (opts.checkInTx) {
+      const err = opts.checkInTx(row)
+      if (err) return { row, error: err }
     }
     db.prepare(`
       UPDATE approval_requests
