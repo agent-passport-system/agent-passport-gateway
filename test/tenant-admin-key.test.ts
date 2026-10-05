@@ -31,8 +31,9 @@ import {
   createPasswordResetToken, consumePasswordResetToken,
 } from '../src/auth/email-password.js'
 import {
-  issueTenantAdminKey, rotateRuntimeKeys, tenantAdminRouter, TENANT_ADMIN_TTL_MS,
+  issueTenantAdminKey, rotateRuntimeKeys, TENANT_ADMIN_TTL_MS,
 } from '../src/auth/tenant-admin.js'
+import { createAuthRouter } from '../src/auth/auth-router.js'
 
 let dbPath: string
 let server: Server
@@ -68,7 +69,7 @@ before(async () => {
 
   const app = express()
   app.use(express.json())
-  app.use(tenantAdminRouter)
+  app.use(createAuthRouter({ sendEmail: async () => ({ sent: false, queued: false }) }))
   app.get('/api/v1/whoami', authMiddleware, (req: any, res) => res.json({ id: req.tenant.id, key_class: req.tenant.key_class }))
   await new Promise<void>((r) => {
     server = app.listen(0, '127.0.0.1', () => {

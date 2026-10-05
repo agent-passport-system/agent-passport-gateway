@@ -25,7 +25,8 @@ import { initDB, getDB } from '../src/db/schema.js'
 import { initGatewayIdentity } from '../src/gateway/identity.js'
 import { createTenant, authMiddleware } from '../src/auth/api-keys.js'
 import { hashPassword, setTenantPassword } from '../src/auth/email-password.js'
-import { tenantAdminRouter, issueTenantAdminKey, TENANT_ADMIN_TTL_MS } from '../src/auth/tenant-admin.js'
+import { issueTenantAdminKey, TENANT_ADMIN_TTL_MS } from '../src/auth/tenant-admin.js'
+import { createAuthRouter } from '../src/auth/auth-router.js'
 import { approverAdminRouter } from '../src/gateway/approval/approvers-router.js'
 import { approvalRouter } from '../src/gateway/approval/index.js'
 import { setApprovalConnectorRouter } from '../src/gateway/approval/connector.js'
@@ -48,7 +49,7 @@ before(async () => {
   })
   const app = express()
   app.use(express.json())
-  app.use(tenantAdminRouter)
+  app.use(createAuthRouter({ sendEmail: async () => ({ sent: false, queued: false }) }))
   app.use('/api/v1', authMiddleware, approverAdminRouter)
   app.use('/api/v1', authMiddleware, approvalRouter)
   await new Promise<void>((r) => {

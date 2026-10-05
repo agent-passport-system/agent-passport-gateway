@@ -8,8 +8,8 @@
  * gateway never decides that on its own.
  *
  * Lifecycle:
- *   - issued only by POST /auth/tenant-admin/issue, which needs the account
- *     owner's email and password. Ordinary login, signup, GitHub OAuth and
+ *   - issued only by POST /auth/tenant-admin/issue (auth-router.ts), which
+ *     needs the account owner's email and password. Ordinary login, signup, GitHub OAuth and
  *     runtime rotate/regenerate never mint one, and no API key can.
  *   - expires TENANT_ADMIN_TTL_MS after issuance. authenticateKey refuses
  *     it after that. Nothing extends expires_at; a new one needs the
@@ -20,13 +20,8 @@
  *     (revokeAllApiKeysForTenant in email-password.ts).
  */
 
-import { Router } from 'express'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { getDB } from '../db/schema.js'
-import {
-  isValidEmail, normalizeEmail, findTenantByEmail, verifyPassword, burnTime,
-} from './email-password.js'
 
 /** Fixed lifetime of a tenant_admin key. The codebase has no session TTL
  *  convention for API keys, so this is the 15-minute default. */
@@ -44,7 +39,7 @@ function newRawKey(): { rawKey: string; keyHash: string; keyPrefix: string } {
 /**
  * Mint a tenant_admin key that expires TENANT_ADMIN_TTL_MS from now.
  * Callers must have checked the account password first; the only one is
- * the issuance route below.
+ * the issuance route in auth-router.ts.
  */
 export function issueTenantAdminKey(tenantId: string, nowMs = Date.now()): {
   apiKey: string; keyId: string; expiresAt: string
@@ -82,53 +77,3 @@ export function rotateRuntimeKeys(tenantId: string, name: string): {
   })()
   return { apiKey: rawKey, keyPrefix, revoked }
 }
-
-// Same budget as POST /auth/email/login: 10 attempts per 15 min per IP.
-const tenantAdminIssueLimiter = new RateLimiterMemory({
-  points: 10,
-  duration: 900,
-  keyPrefix: 'tenant_admin_issue',
-})
-
-export const tenantAdminRouter = Router()
-
-// POST /auth/tenant-admin/issue — explicit admin-issuance action.
-// Body: { email, password } of the account owner. Not authenticated by an
-// API key on purpose: a runtime key (or an expiring admin key) cannot mint
-// or renew an admin key. Failure answers match POST /auth/email/login.
-tenantAdminRouter.post('/auth/tenant-admin/issue', async (req, res) => {
-  try {
-    await tenantAdminIssueLimiter.consume(req.ip || 'unknown')
-  } catch {
-    return res.status(429).json({ error: 'Too many attempts, try again later.' })
-  }
-
-  const { email: rawEmail, password } = req.body || {}
-  if (!rawEmail || typeof rawEmail !== 'string' || !isValidEmail(rawEmail)
-      || typeof password !== 'string' || password.length === 0) {
-    await burnTime()
-    return res.status(401).json({ error: 'Invalid email or password' })
-  }
-
-  const tenant = findTenantByEmail(normalizeEmail(rawEmail))
-  if (!tenant || !tenant.password_hash) {
-    await burnTime()
-    return res.status(401).json({ error: 'Invalid email or password' })
-  }
-  if (!(await verifyPassword(password, tenant.password_hash))) {
-    return res.status(401).json({ error: 'Invalid email or password' })
-  }
-  if (tenant.status !== 'active') {
-    return res.status(403).json({ error: 'Account is not active. Contact signal@aeoess.com' })
-  }
-
-  const issued = issueTenantAdminKey(tenant.id)
-  return res.status(201).json({
-    message: 'Tenant admin key issued. It expires at expires_at and cannot be renewed; issue a new one with the password.',
-    tenant_id: tenant.id,
-    api_key: issued.apiKey,
-    key_class: 'tenant_admin',
-    expires_at: issued.expiresAt,
-    ttl_seconds: TENANT_ADMIN_TTL_MS / 1000,
-  })
-})
