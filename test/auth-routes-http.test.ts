@@ -10,6 +10,8 @@
 //   - POST /api/v1/account/rotate-key and regenerate-key revoke and mint
 //     runtime keys only, so an unexpired tenant_admin key keeps working
 //   - POST /auth/email/forgot + /auth/email/reset revoke every key class
+//   - a tenant_admin issuance sends exactly one security notice (account,
+//     time, action, what to do), never the key; a refused one sends none
 
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -226,5 +228,74 @@ describe('POST /auth/email/forgot + /auth/email/reset', () => {
     const token = decodeURIComponent(/reset_token=([^\s"&]+)/.exec(mail.textBody)![1])
     assert.equal((await h.call('POST', '/auth/email/reset', { token, password: 'a different long passphrase' })).status, 200)
     assert.equal((await h.call('POST', '/auth/email/reset', { token, password: 'yet another long passphrase' })).status, 400)
+  })
+})
+
+describe('tenant_admin issuance security notice', () => {
+  let h: Harness
+  before(async () => { h = await harness() })
+  after(() => h.close())
+
+  it('a successful issuance sends exactly one notice to the account address, without the key', async () => {
+    const t = await tenantWithPassword()
+    const before = h.mails.length
+    const r = await h.call('POST', '/auth/tenant-admin/issue', { email: t.email, password: PASSWORD })
+    assert.equal(r.status, 201)
+    const sent = h.mails.slice(before)
+    assert.equal(sent.length, 1)
+    const m = sent[0]
+    assert.equal(m.to, t.email)
+    assert.match(m.subject, /tenant admin key issued/i)
+    // Account, time, action, and what to do if it was not them.
+    assert.ok(m.textBody.includes(`Account: ${t.email}`))
+    const time = /Time: (\S+)/.exec(m.textBody)![1]
+    assert.ok(Math.abs(Date.parse(time) - Date.now()) < 60_000)
+    assert.ok(m.textBody.includes('Action: tenant admin key issued'))
+    assert.ok(m.textBody.includes(r.json.expires_at))
+    assert.match(m.textBody, /If this was NOT you/)
+    assert.match(m.textBody, /Forgot Password/)
+    // Never the key, not even its prefix.
+    const whole = JSON.stringify(m)
+    assert.ok(!whole.includes(r.json.api_key))
+    assert.ok(!whole.includes(r.json.api_key.slice(0, 12)))
+    assert.ok(!whole.includes(PASSWORD))
+  })
+
+  it('a failed issuance sends none', async () => {
+    const t = await tenantWithPassword()
+    const inactive = await tenantWithPassword()
+    getDB().prepare(`UPDATE tenants SET status = 'suspended' WHERE id = ?`).run(inactive.id)
+    const before = h.mails.length
+    for (const [body, key] of [
+      [{ email: t.email, password: 'not the password' }, undefined],
+      [{ email: t.email }, undefined],
+      [{ email: `nobody-${randomUUID()}@test.local`, password: PASSWORD }, undefined],
+      [{}, t.signupKey],
+      [{ email: inactive.email, password: PASSWORD }, undefined],
+    ] as Array<[unknown, string | undefined]>) {
+      const r = await h.call('POST', '/auth/tenant-admin/issue', body, key)
+      assert.ok(r.status === 401 || r.status === 403, `${JSON.stringify(body)} -> ${r.status}`)
+    }
+    assert.equal(h.mails.length, before, 'no notice for a refused issuance')
+    assert.equal(count(t.id, 'tenant_admin'), 0)
+    assert.equal(count(inactive.id, 'tenant_admin'), 0)
+  })
+
+  it('a mailer failure does not undo the issuance', async () => {
+    const mails: EmailOptions[] = []
+    const app = express()
+    app.use(express.json())
+    app.use(createAuthRouter({ sendEmail: async (m) => { mails.push(m); throw new Error('smtp down') } }))
+    const server: Server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)) })
+    try {
+      const t = await tenantWithPassword()
+      const r = await fetch(`http://127.0.0.1:${(server.address() as any).port}/auth/tenant-admin/issue`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: t.email, password: PASSWORD }),
+      })
+      assert.equal(r.status, 201)
+      assert.equal(mails.length, 1)
+      assert.equal(count(t.id, 'tenant_admin'), 1)
+    } finally { server.close() }
   })
 })

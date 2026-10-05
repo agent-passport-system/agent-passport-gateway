@@ -35,7 +35,7 @@ import { issueTenantAdminKey, rotateRuntimeKeys, TENANT_ADMIN_TTL_MS } from './t
 import { getEventBus } from '../gateway/events.js'
 import {
   sendEmail as defaultSendEmail, passwordResetEmail, passwordChangedEmail,
-  type EmailOptions,
+  tenantAdminIssuedEmail, type EmailOptions,
 } from '../notifications/email.js'
 
 export interface AuthRouterOptions {
@@ -133,6 +133,7 @@ export function createAuthRouter(opts: AuthRouterOptions = {}): Router {
   // Body: { email, password } of the account owner. Not authenticated by an
   // API key on purpose: a runtime key (or an expiring admin key) cannot mint
   // or renew an admin key. Failure answers match POST /auth/email/login.
+  // A successful issuance sends one security notice to the account address.
   router.post('/auth/tenant-admin/issue', async (req, res) => {
     try {
       await tenantAdminIssueLimiter.consume(req.ip || 'unknown')
@@ -159,7 +160,19 @@ export function createAuthRouter(opts: AuthRouterOptions = {}): Router {
       return res.status(403).json({ error: 'Account is not active. Contact signal@aeoess.com' })
     }
 
-    const issued = issueTenantAdminKey(tenant.id)
+    const issuedAt = Date.now()
+    const issued = issueTenantAdminKey(tenant.id, issuedAt)
+
+    // Security notice to the stored account address, sent only after the
+    // key exists. Best-effort like regenerate-key: a mail failure does not
+    // undo the issuance. The notice never carries the key.
+    try {
+      sendEmail({
+        ...tenantAdminIssuedEmail(tenant.name || tenant.email, tenant.email,
+          new Date(issuedAt).toISOString(), issued.expiresAt),
+        to: tenant.email,
+      }).catch(() => {})
+    } catch {}
 
     return res.status(201).json({
       message: 'Tenant admin key issued. It expires at expires_at and cannot be renewed; issue a new one with the password.',

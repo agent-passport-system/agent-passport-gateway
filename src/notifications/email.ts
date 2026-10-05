@@ -388,6 +388,38 @@ If this was NOT you, contact signal@aeoess.com immediately.
   return { to: email, subject: 'Your AEOESS password was changed', textBody: text, htmlBody: html }
 }
 
+/** Security notice sent when a tenant_admin key is issued
+ *  (POST /auth/tenant-admin/issue). Says which account, when, and what was
+ *  done, and what to do if it was not the owner. Never carries the key. */
+export function tenantAdminIssuedEmail(name: string, email: string, issuedAt: string, expiresAt: string): EmailOptions {
+  const text = `A tenant admin key was issued for your AEOESS account, ${name}.
+
+Account: ${email}
+Time: ${issuedAt}
+Action: tenant admin key issued with the account password (expires ${expiresAt})
+
+A tenant admin key can register and revoke the approvers for this account.
+
+If this was you, no further action is needed.
+
+If this was NOT you, someone has your password. Reset it now with Forgot Password on the sign-in page. A reset revokes every API key for this account, including this admin key. Then contact signal@aeoess.com.
+
+-- AEOESS`
+
+  const html = `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;color:#1a1a2e">
+<h2 style="color:#63b3ed">Tenant admin key issued</h2>
+<p>Hi ${esc(name)},</p>
+<p>A tenant admin key was issued for your AEOESS account.</p>
+<p style="font-size:13px">Account: <strong>${esc(email)}</strong><br>Time: ${esc(issuedAt)}<br>Action: tenant admin key issued with the account password (expires ${esc(expiresAt)})</p>
+<p style="font-size:13px;color:#1a1a2e">A tenant admin key can register and revoke the approvers for this account.</p>
+<p style="font-size:13px;color:#e53e3e"><strong>If this was not you, someone has your password. Reset it now with Forgot Password on the sign-in page. A reset revokes every API key for this account, including this admin key. Then contact <a href="mailto:signal@aeoess.com" style="color:#e53e3e">signal@aeoess.com</a>.</strong></p>
+<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">
+<p style="font-size:12px;color:#718096">AEOESS - Enforcement infrastructure for AI agents</p>
+</div>`
+
+  return { to: email, subject: 'AEOESS security notice: tenant admin key issued', textBody: text, htmlBody: html }
+}
+
 // HTML escape helper
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
