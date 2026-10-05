@@ -15,6 +15,10 @@
  *   POST /approvals/:id/sign        - an approver signs (scoped-authority gated)
  *   POST /approvals/:id/decide      - finalize approve/reject + issue receipt
  *   GET  /approvals/:id/receipt     - fetch the issued approval receipt
+ *                                     (full signed payload, tenant-authenticated)
+ *
+ * Approvers are registered by the tenant admin (approvers-router.ts,
+ * /approvers, tenant_admin key only).
  *
  * Consumes (does not reinvent):
  *   - SDK createApprovalRequest / addApprovalSignature / evaluateThreshold
@@ -23,7 +27,8 @@
  *   - getGatewayIdentity().sign (via receipts.ts) for the receipt signature.
  *   - getEventBus().emit for the SSE spine.
  *   - v2 effect-sampling for the review-sample pull.
- *   - v2 approval-fatigue to block rubber-stamping.
+ *   - v2 approval-fatigue history, fed only by accepted signatures. It
+ *     does not block a signature (see /sign).
  *   - v2 separation-of-powers for approver-outside-owner.
  *   - v2 scope-violations is available for action-class scope match; the
  *     scoped-authority gate here uses policy.checkScopedAuthority.
@@ -60,7 +65,7 @@ import {
   createSamplingPolicy, shouldSample, recordSample,
 } from '../../sdk-migrated/v2/effect-sampling.js'
 import {
-  recordApproval, checkRubberStamping, checkImpossibleLatency,
+  recordApproval, checkRubberStamping,
 } from '../../sdk-migrated/v2/approval-fatigue.js'
 
 // ── SDK charter approval surface (consume the real threshold/signature core).
@@ -127,6 +132,24 @@ function agentPublicKey(tenantId: string, agentId: string): string | null {
  *  Silently dropping them would let a caller believe "transfer of 100 to
  *  acct-A" was approved when only the action class and scope were. */
 const UNBINDABLE_FIELDS = ['amount', 'currency', 'params', 'target'] as const
+
+/** /sign body fields the gateway derives from storage. approver_id selects
+ *  a registered approver; its key, authority, key class and office come
+ *  from the registry and the elapsed time is measured by the server, so a
+ *  body carrying any of these is refused rather than silently ignored. */
+const SERVER_BOUND_SIGN_FIELDS = [
+  'approver_public_key', 'authority', 'key_class', 'office_id', 'decision_latency_ms',
+] as const
+
+function rejectServerBound(body: any, res: any): boolean {
+  const present = SERVER_BOUND_SIGN_FIELDS.filter(f => body && Object.prototype.hasOwnProperty.call(body, f))
+  if (present.length === 0) return false
+  res.status(400).json({
+    error: `Fields set by the gateway, not the caller: ${present.join(', ')}. Send approver_id, reason and signature.`,
+    code: 'server_bound_field', fields: present,
+  })
+  return true
+}
 
 function rejectUnbindable(body: any, res: any): boolean {
   const present = UNBINDABLE_FIELDS.filter(f => body && Object.prototype.hasOwnProperty.call(body, f))
@@ -227,6 +250,9 @@ approvalRouter.post('/approvals', async (req: any, res) => {
     subjectType: subject_type || 'delegation',
     riskTier: tier,
     requestedBy: requested_by,
+    // The key that opened the request, recorded server-side. requested_by
+    // is a caller-supplied label and is not used for the independence check.
+    requestedByKeyId: tenant.key_id ?? null,
     agentId: agent_id,
     agentOwnerId: agentOwner,
     requestedScope: scopeArr,
@@ -310,18 +336,24 @@ approvalRouter.get('/approvals/:id', (req: any, res) => {
 
 // ═══════════════════════════════════════
 // POST /approvals/:id/sign - an approver signs
-// The approver is resolved from the approver registry (approvers.ts) and
-// must present an Ed25519 signature, under its registered key, over the
-// request commitment (commitment.ts). Body approver_public_key, authority,
-// key_class, office_id and decision_latency_ms are not read: identity,
-// key, authority and office come from the registry and the review
-// interval is measured by the server. Then the scoped-authority gate:
-// authority match; high-risk requires an approver outside the agent owner
-// and forbids bulk; reason required; rubber-stamping blocked.
+// Body: approver_id, reason, signature. approver_id selects an approver the
+// tenant admin registered (approvers.ts); its key, authority, key class and
+// office come from the registry. approver_public_key, authority, key_class,
+// office_id and decision_latency_ms in the body are refused with 400
+// server_bound_field. batch_size is not read: one /sign call carries one
+// signature over one request commitment, so the batch is always 1.
+// The signature must verify under the registered key over the request
+// commitment (commitment.ts). Then the scoped-authority gate: authority
+// match; for high-risk tiers the approver must be independent of the
+// owner side (see below); reason required.
+// Elapsed time since the request opened is recorded as telemetry and is
+// never a reason to refuse.
 // ═══════════════════════════════════════
 approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
   bootstrap()
   const tenant: Tenant = req.tenant
+  // Server clock at arrival, before any other work.
+  const arrivedMs = Date.now()
   sweepExpired(tenant.id)
 
   const row = getRequest(tenant.id, req.params.id)
@@ -334,7 +366,8 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
   }
 
   if (rejectUnbindable(req.body, res)) return
-  const { approver_id, reason, signature, batch_size } = req.body || {}
+  if (rejectServerBound(req.body, res)) return
+  const { approver_id, reason, signature } = req.body || {}
 
   if (!approver_id || !reason) {
     return res.status(400).json({ error: 'Required: approver_id, reason, signature' })
@@ -366,17 +399,23 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
   }
 
   const tier = row.risk_tier as RiskTier
-  const batchSize = typeof batch_size === 'number' && batch_size > 0 ? batch_size : 1
 
-  // The agent approving itself with its own key is self-approval too.
+  // Independence check for high-risk tiers. It compares registered
+  // identities and key material only, never caller-supplied names:
+  //   owner side  = the agent owner (agents.entity_id, else the tenant id),
+  //                 the agent itself (agent_id), and the API key that opened
+  //                 the request (requested_by_key_id, recorded server-side)
+  //   approver    = its registered approver_id and principal_id
+  //   key         = the agent's registered public key vs the approver key
+  // It shows the approver is not registered as one of those identities and
+  // does not hold the agent's key. It does not prove that a different human
+  // holds the approver key: that is up to the tenant admin who registered it.
   if (isHighRiskTier(tier) && agentPublicKey(tenant.id, row.agent_id) === approver.public_key) {
     return res.status(403).json({
       error: 'High-risk approval requires an approver outside the agent owner',
       code: 'self_approval_high_risk',
     })
   }
-
-  // Scoped-authority gate (policy.ts) against the resolved approver.
   const scopeCheck = checkScopedAuthority({
     actionClass: row.action_class,
     tier,
@@ -384,41 +423,18 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
     approverId: approver.approver_id,
     approverPrincipalId: approver.principal_id,
     agentOwnerId: row.agent_owner_id,
-    ownerAliases: [row.requested_by],
-    batchSize,
+    ownerAliases: [row.agent_id, row.requested_by_key_id].filter((x): x is string => !!x),
+    batchSize: 1,
   })
   if (!scopeCheck.allowed) {
     return res.status(403).json({ error: scopeCheck.reason, code: scopeCheck.code })
   }
 
-  // Anti rubber-stamp. The latency is server-measured: from the request's
-  // created_at (written by this server at open) to this signature's arrival.
-  // It bounds the review window from above; it cannot prove the approver
-  // read the request, but it does stop instant scripted sign-offs, and the
-  // caller can no longer supply the number.
-  const nowMs = Date.now()
+  // Request age at arrival: created_at (written by this server at open) to
+  // arrivedMs. Telemetry only. It says nothing about how long anyone read
+  // the request; a caller can wait or not.
   const openedMs = parseStoredTime(row.created_at)
-  const latency = Number.isFinite(openedMs) ? Math.max(0, nowMs - openedMs) : 0
-  const fatigueRecord = {
-    id: randomUUID(),
-    principal_id: approver.approver_id,
-    agent_id: row.agent_id,
-    intent_id: row.id,
-    decision: 'approved' as const,
-    decision_latency_ms: latency,
-    risk_class: tier,
-    intent_complexity: isHighRiskTier(tier) ? 0.8 : 0.2,
-    timestamp: new Date(nowMs).toISOString(),
-  }
-  recordApproval(fatigueRecord)
-  const impossible = checkImpossibleLatency(fatigueRecord)
-  const rubber = checkRubberStamping(approver.approver_id)
-  if (impossible || rubber) {
-    return res.status(429).json({
-      error: 'Approval blocked: rubber-stamping or impossible-latency pattern detected',
-      flag: (impossible || rubber)!.fatigue_type,
-    })
-  }
+  const elapsedMs = Number.isFinite(openedMs) ? Math.max(0, arrivedMs - openedMs) : null
 
   // Persist the verified signature with the registry key and office.
   let sigId: string
@@ -432,7 +448,7 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
       officeId: approver.office_id,
       reason,
       signature,
-      decisionLatencyMs: latency,
+      elapsedSinceOpenMs: elapsedMs,
     })
   } catch (e: any) {
     if (String(e?.message || '').includes('UNIQUE')) {
@@ -441,8 +457,27 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
     throw e
   }
 
+  // Fatigue history is written only here, after the signature is accepted
+  // and stored, so a refused attempt is never recorded and a retry (which
+  // hits the UNIQUE above) cannot add history. The helper's latency field
+  // carries the request age; it is not reading time. The rubber-stamp
+  // check is reported, not enforced: its threshold uses that age.
+  recordApproval({
+    id: sigId,
+    principal_id: approver.approver_id,
+    agent_id: row.agent_id,
+    intent_id: row.id,
+    decision: 'approved',
+    decision_latency_ms: elapsedMs ?? 0,
+    risk_class: tier,
+    intent_complexity: isHighRiskTier(tier) ? 0.8 : 0.2,
+    timestamp: new Date(arrivedMs).toISOString(),
+  })
+  const fatigueFlag = checkRubberStamping(approver.approver_id)
+
   res.status(201).json({
     signature_id: sigId, request_id: row.id, commitment_digest: commitment.digest,
+    fatigue_flag: fatigueFlag ? fatigueFlag.fatigue_type : null,
   })
 })
 

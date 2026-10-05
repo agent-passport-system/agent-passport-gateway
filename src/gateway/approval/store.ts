@@ -115,6 +115,13 @@ export function initApprovalTables(): void {
       UNIQUE (tenant_id, public_key)
     );
   `)
+  // requested_by_key_id: api_keys.id of the key that opened the request,
+  // recorded by the server (the requester side of the independence check).
+  // elapsed_since_open_ms: request created_at to /sign arrival, both server
+  // clocks. Telemetry only, never an authorization input, and not a measure
+  // of how long anyone read the request.
+  try { db.exec(`ALTER TABLE approval_requests ADD COLUMN requested_by_key_id TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE approval_signatures ADD COLUMN elapsed_since_open_ms INTEGER`) } catch {}
   _initialized = true
 }
 
@@ -129,6 +136,7 @@ export interface ApprovalRequestRow {
   subject_type: string
   risk_tier: RiskTier
   requested_by: string
+  requested_by_key_id: string | null
   agent_id: string
   agent_owner_id: string
   requested_scope: string
@@ -148,6 +156,7 @@ export function insertRequest(row: {
   subjectType: string
   riskTier: RiskTier
   requestedBy: string
+  requestedByKeyId?: string | null
   agentId: string
   agentOwnerId: string
   requestedScope: string[]
@@ -155,18 +164,18 @@ export function insertRequest(row: {
 }): string {
   const db = getDB()
   const id = randomUUID()
-  // created_at is written with millisecond precision (ISO) because the
-  // server-side review interval in /sign is measured from it.
+  // created_at is written with millisecond precision (ISO) because /sign
+  // records the server-measured elapsed time from it (telemetry).
   db.prepare(`
     INSERT INTO approval_requests (
       id, tenant_id, sdk_request_id, action_class, subject, subject_type,
-      risk_tier, requested_by, agent_id, agent_owner_id, requested_scope,
-      status, created_at, expires_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      risk_tier, requested_by, requested_by_key_id, agent_id, agent_owner_id,
+      requested_scope, status, created_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
   `).run(
     id, row.tenantId, row.sdkRequestId, row.actionClass, row.subject,
-    row.subjectType, row.riskTier, row.requestedBy, row.agentId,
-    row.agentOwnerId, JSON.stringify(row.requestedScope),
+    row.subjectType, row.riskTier, row.requestedBy, row.requestedByKeyId ?? null,
+    row.agentId, row.agentOwnerId, JSON.stringify(row.requestedScope),
     new Date().toISOString(), row.expiresAt,
   )
   return id
@@ -266,19 +275,22 @@ export function insertSignature(row: {
   officeId?: string | null
   reason: string
   signature: string
-  decisionLatencyMs?: number | null
+  /** Server-measured request age at /sign arrival. Telemetry only. */
+  elapsedSinceOpenMs?: number | null
 }): string {
   const db = getDB()
   const id = randomUUID()
+  // decision_latency_ms is left NULL on new rows. Older rows may hold a
+  // caller-supplied number; new rows write elapsed_since_open_ms instead.
   db.prepare(`
     INSERT INTO approval_signatures (
       id, tenant_id, request_id, approver_id, approver_public_key,
-      key_class, office_id, reason, signature, decision_latency_ms
+      key_class, office_id, reason, signature, elapsed_since_open_ms
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, row.tenantId, row.requestId, row.approverId, row.approverPublicKey,
     row.keyClass, row.officeId ?? null, row.reason, row.signature,
-    row.decisionLatencyMs ?? null,
+    row.elapsedSinceOpenMs ?? null,
   )
   return id
 }

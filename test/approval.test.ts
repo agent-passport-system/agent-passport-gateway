@@ -109,8 +109,8 @@ function registerTestApprover(approverId: string, authority: string[], principal
 function commitSig(requestId: string, kp: Kp): string {
   return edSign(approvalCommitment(getRequest(TENANT, requestId)!).message, kp.privateKey)
 }
-/** Move created_at back so the server-measured review interval clears the
- *  impossible-latency floor (created_at is not part of the commitment). */
+/** Move created_at back. Elapsed time is telemetry only and no longer
+ *  gates /sign; kept so the stored elapsed value is non-trivial. */
 function backdate(requestId: string, ms = 60_000) {
   getDB().prepare(`UPDATE approval_requests SET created_at = ? WHERE id = ?`)
     .run(new Date(Date.now() - ms).toISOString(), requestId)
@@ -204,7 +204,7 @@ describe('no bulk approvals for high-risk', () => {
     assert.equal(r.allowed, true)
   })
 
-  it('route: POST /approvals/:id/sign with batch_size>1 on high-risk is 403 bulk_high_risk', async () => {
+  it('route: body batch_size is not read; one /sign covers one request, so the batch is 1', async () => {
     const created = await post('/approvals', {
       action_class: 'payments:refund', subject: 'inv-1',
       agent_id: AGENT, requested_by: 'requester',
@@ -217,8 +217,9 @@ describe('no bulk approvals for high-risk', () => {
       approver_id: 'outsider-bulk', reason: 'reviewed the refund batch',
       signature: commitSig(created.json.id, kp), batch_size: 12,
     })
-    assert.equal(signed.status, 403)
-    assert.equal(signed.json.code, 'bulk_high_risk')
+    // The body claim neither triggers nor suppresses the bulk rule: the
+    // server derives batch size 1 for a single-request signature.
+    assert.equal(signed.status, 201)
   })
 })
 

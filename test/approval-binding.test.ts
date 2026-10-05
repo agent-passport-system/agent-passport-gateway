@@ -25,12 +25,14 @@ import {
 } from '../src/gateway/approval/commitment.js'
 import { getRequest, decideRequest, type ApprovalRequestRow } from '../src/gateway/approval/store.js'
 import { previewCascade } from '../src/gateway/revocation/cascade.js'
-import { clearApprovalFatigueStores } from '../src/sdk-migrated/v2/approval-fatigue.js'
+import { clearApprovalFatigueStores, getApprovalHistory } from '../src/sdk-migrated/v2/approval-fatigue.js'
 
 const TENANT = 'tenant-binding'
 const OWNER = 'entity-owner'
 const AGENT = 'agent-pay'
 const AGENT_KP = generateKeyPair()
+// api_keys.id of the key the harness authenticates as (the requester key).
+const REQUESTER_KEY_ID = 'key-runtime-requester'
 
 let server: Server
 let baseUrl: string
@@ -50,7 +52,7 @@ before(async () => {
 
   const app = express()
   app.use(express.json())
-  app.use((req: any, _res, next) => { req.tenant = { id: TENANT, role: 'user' }; next() })
+  app.use((req: any, _res, next) => { req.tenant = { id: TENANT, role: 'user', key_class: 'runtime', key_id: REQUESTER_KEY_ID }; next() })
   app.use('/api/v1', approvalRouter)
   await new Promise<void>((r) => {
     server = app.listen(0, '127.0.0.1', () => {
@@ -198,20 +200,18 @@ describe('sign - approver resolved from registry and signature verified', () => 
     const id = await open(); backdate(id)
     const kp = generateKeyPair()
     const r = await call('POST', `/approvals/${id}/sign`, {
-      approver_id: 'never-registered', approver_public_key: kp.publicKey,
-      authority: ['*'], reason: 'reviewed it', signature: sigFor(id, kp),
+      approver_id: 'never-registered', reason: 'reviewed it', signature: sigFor(id, kp),
     })
     assert.equal(r.status, 403)
     assert.equal(r.json.code, 'approver_not_registered')
   })
 
-  it('a signature by an unregistered key fails even under a registered approver id (body key ignored)', async () => {
+  it('a signature by an unregistered key fails under a registered approver id', async () => {
     const a = approver(['payments:*'])
     const id = await open(); backdate(id)
     const attacker = generateKeyPair()
     const r = await call('POST', `/approvals/${id}/sign`, {
-      approver_id: a.id, approver_public_key: attacker.publicKey,
-      reason: 'reviewed it', signature: sigFor(id, attacker),
+      approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, attacker),
     })
     assert.equal(r.status, 403)
     assert.equal(r.json.code, 'approver_signature_invalid')
@@ -233,12 +233,30 @@ describe('sign - approver resolved from registry and signature verified', () => 
     assert.equal(r.json.code, 'self_approval_high_risk')
   })
 
-  it('an approver whose principal is the requester fails', async () => {
-    const a = approver(['payments:*'], 'requester-1')
+  it('an approver whose principal is the requesting key (server-recorded) fails', async () => {
+    const a = approver(['payments:*'], REQUESTER_KEY_ID)
+    const id = await open(); backdate(id)
+    assert.equal(getRequest(TENANT, id)!.requested_by_key_id, REQUESTER_KEY_ID)
+    const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+    assert.equal(r.status, 403)
+    assert.equal(r.json.code, 'self_approval_high_risk')
+  })
+
+  it('an approver whose principal is the agent itself fails', async () => {
+    const a = approver(['payments:*'], AGENT)
     const id = await open(); backdate(id)
     const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
     assert.equal(r.status, 403)
     assert.equal(r.json.code, 'self_approval_high_risk')
+  })
+
+  it('the caller-supplied requested_by label is not compared', async () => {
+    // Same string as the body requested_by, but nothing registered ties it
+    // to the requester, so it is not an identity the check can rely on.
+    const a = approver(['payments:*'], 'requester-1')
+    const id = await open(); backdate(id)
+    const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+    assert.equal(r.status, 201, JSON.stringify(r.json))
   })
 
   it('an approver registered with the agent own key fails', async () => {
@@ -253,34 +271,158 @@ describe('sign - approver resolved from registry and signature verified', () => 
     assert.equal(r.json.code, 'self_approval_high_risk')
   })
 
-  it('body authority ["*"] grants nothing: registry authority decides', async () => {
+  it('registry authority decides: an approver without it is refused', async () => {
     const a = approver(['read:*'])
     const id = await open(); backdate(id)
-    const r = await call('POST', `/approvals/${id}/sign`, {
-      approver_id: a.id, authority: ['*'], reason: 'reviewed it', signature: sigFor(id, a.kp),
-    })
+    const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
     assert.equal(r.status, 403)
     assert.equal(r.json.code, 'authority_missing')
-  })
-
-  it('body decision_latency_ms is ignored: an instant sign is refused on server timing', async () => {
-    const a = approver(['payments:*'])
-    const id = await open()
-    const r = await call('POST', `/approvals/${id}/sign`, {
-      approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp), decision_latency_ms: 600000,
-    })
-    assert.equal(r.status, 429)
-    assert.equal(r.json.flag, 'latency_impossible')
-    const stored = getDB().prepare(`SELECT COUNT(*) c FROM approval_signatures WHERE request_id = ?`).get(id) as any
-    assert.equal(stored.c, 0)
   })
 
   it('an approver key cannot be registered twice under an alias id', () => {
     const a = approver(['payments:*'])
     assert.throws(() => registerApprover({
       tenantId: TENANT, approverId: `${a.id}-alias`, publicKey: a.kp.publicKey,
-      authority: ['*'], principalId: 'someone-else', registeredBy: 'test-operator',
+      authority: ['payments:*'], principalId: 'someone-else', registeredBy: 'test-operator',
     }), /UNIQUE/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// D2: server-bound fields on /sign are refused by name
+// ─────────────────────────────────────────────────────────────────────
+
+describe('sign - server-bound body fields are refused', () => {
+  const cases: Array<[string, unknown]> = [
+    ['approver_public_key', 'ab'.repeat(32)],
+    ['authority', ['*']],
+    ['key_class', 'approver'],
+    ['office_id', 'treasury'],
+    ['decision_latency_ms', 600000],
+  ]
+  for (const [field, value] of cases) {
+    it(`${field} in the body is 400 server_bound_field and stores nothing`, async () => {
+      const a = approver(['payments:*'])
+      const id = await open(); backdate(id)
+      const r = await call('POST', `/approvals/${id}/sign`, {
+        approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp), [field]: value,
+      })
+      assert.equal(r.status, 400)
+      assert.equal(r.json.code, 'server_bound_field')
+      assert.deepEqual(r.json.fields, [field])
+      const c = getDB().prepare(`SELECT COUNT(*) c FROM approval_signatures WHERE request_id = ?`).get(id) as any
+      assert.equal(c.c, 0)
+      assert.equal(getApprovalHistory(a.id).length, 0)
+    })
+  }
+
+  it('all five together are named in one 400', async () => {
+    const a = approver(['payments:*'])
+    const id = await open(); backdate(id)
+    const r = await call('POST', `/approvals/${id}/sign`, {
+      approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp),
+      ...Object.fromEntries(cases),
+    })
+    assert.equal(r.status, 400)
+    assert.deepEqual(r.json.fields, cases.map(c => c[0]))
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// D4: elapsed time is telemetry, fatigue history only from accepted signs
+// ─────────────────────────────────────────────────────────────────────
+
+describe('sign - elapsed time is not an authorization input', () => {
+  it('a sign 1 ms after open is accepted when everything else is valid', async () => {
+    const a = approver(['payments:*'])
+    const id = await open(); backdate(id, 1)
+    const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+    assert.equal(r.status, 201, JSON.stringify(r.json))
+    assert.equal(getApprovalHistory(a.id).length, 1)
+  })
+
+  it('a created_at later than arrival records elapsed 0 and is accepted', async () => {
+    const a = approver(['payments:*'])
+    const id = await open()
+    getDB().prepare(`UPDATE approval_requests SET created_at = ? WHERE id = ?`).run(new Date(Date.now() + 5_000).toISOString(), id)
+    const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+    assert.equal(r.status, 201, JSON.stringify(r.json))
+    const row = getDB().prepare(`SELECT elapsed_since_open_ms FROM approval_signatures WHERE request_id = ?`).get(id) as any
+    assert.equal(row.elapsed_since_open_ms, 0, 'a created_at in the future clamps to 0')
+  })
+
+  it('the stored elapsed value is measured by the server from created_at', async () => {
+    const a = approver(['payments:*'])
+    const id = await open(); backdate(id, 90_000)
+    const before = Date.now()
+    const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+    const after = Date.now()
+    assert.equal(r.status, 201)
+    const created = Date.parse(getRequest(TENANT, id)!.created_at)
+    const row = getDB().prepare(
+      `SELECT elapsed_since_open_ms, decision_latency_ms FROM approval_signatures WHERE request_id = ?`,
+    ).get(id) as any
+    assert.ok(row.elapsed_since_open_ms >= before - created && row.elapsed_since_open_ms <= after - created,
+      `elapsed ${row.elapsed_since_open_ms} within [${before - created}, ${after - created}]`)
+    assert.equal(row.decision_latency_ms, null, 'the old caller-number column is not written')
+    assert.equal(getApprovalHistory(a.id)[0].decision_latency_ms, row.elapsed_since_open_ms)
+  })
+
+  it('refused attempts and retries leave fatigue history unchanged', async () => {
+    const a = approver(['payments:*'])
+    const id = await open(); backdate(id)
+    const other = await open()
+    const attempts: Array<Record<string, unknown>> = [
+      { approver_id: a.id, reason: 'reviewed it', signature: 'not-a-signature' },
+      { approver_id: a.id, reason: 'reviewed it', signature: sigFor(other, a.kp) },
+      { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp), decision_latency_ms: 1 },
+      { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp), amount: 1 },
+      { approver_id: a.id, reason: 'x', signature: sigFor(id, a.kp) },
+      { approver_id: a.id, reason: 'reviewed it', signature: '' },
+    ]
+    for (let i = 0; i < 3; i++) {
+      for (const body of attempts) {
+        const r = await call('POST', `/approvals/${id}/sign`, body)
+        assert.ok(r.status >= 400, `${JSON.stringify(body)} -> ${r.status}`)
+      }
+    }
+    assert.equal(getApprovalHistory(a.id).length, 0, 'no refused attempt was recorded')
+
+    const ok = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+    assert.equal(ok.status, 201)
+    assert.equal(getApprovalHistory(a.id).length, 1)
+    for (let i = 0; i < 5; i++) {
+      const again = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+      assert.equal(again.status, 409)
+    }
+    assert.equal(getApprovalHistory(a.id).length, 1, 'retries add no history')
+  })
+
+  it('an owner-side approver refusal is not recorded either', async () => {
+    const a = approver(['payments:*'], OWNER)
+    const id = await open(); backdate(id)
+    for (let i = 0; i < 3; i++) {
+      const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+      assert.equal(r.status, 403)
+    }
+    assert.equal(getApprovalHistory(a.id).length, 0)
+  })
+
+  it('twenty fast accepted signs are not refused; the rubber-stamp pattern is reported only', async () => {
+    const a = approver(['payments:*'])
+    const flags: Array<string | null> = []
+    for (let i = 0; i < 21; i++) {
+      const id = await open()
+      const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
+      assert.equal(r.status, 201, `sign ${i}: ${JSON.stringify(r.json)}`)
+      flags.push(r.json.fatigue_flag)
+    }
+    assert.equal(getApprovalHistory(a.id).length, 21)
+    // Reported once, at the 20th accepted signature (the helper's window),
+    // and never turned into a refusal. The helper does not re-raise an
+    // unreviewed flag.
+    assert.equal(flags[19], 'rubber_stamping')
+    assert.equal(flags.filter(Boolean).length, 1)
   })
 })
 
@@ -307,9 +449,9 @@ describe('decide - evidence re-verified and committed in the receipt', () => {
     assert.equal(s.status, 201, JSON.stringify(s.json))
     assert.equal(s.json.commitment_digest, expected.digest)
 
-    const sigRow = getDB().prepare(`SELECT approver_public_key, decision_latency_ms FROM approval_signatures WHERE request_id = ?`).get(id) as any
+    const sigRow = getDB().prepare(`SELECT approver_public_key, elapsed_since_open_ms FROM approval_signatures WHERE request_id = ?`).get(id) as any
     assert.equal(sigRow.approver_public_key, a.kp.publicKey, 'registry key stored, not a body key')
-    assert.ok(sigRow.decision_latency_ms >= 59_000, 'server-measured interval stored')
+    assert.ok(sigRow.elapsed_since_open_ms >= 59_000, 'server-measured elapsed time stored')
 
     const d = await call('POST', `/approvals/${id}/decide`, { verdict: 'approved', reason: 'one outside approver signed', decided_by: 'ops' })
     assert.equal(d.status, 200, JSON.stringify(d.json))

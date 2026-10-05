@@ -85,6 +85,7 @@ import { automationsRouter } from './gateway/automations/router.js'
 import { playbooksRouter } from './gateway/playbooks/router.js'
 import { initPlaybookTables } from './gateway/playbooks/index.js'
 import { approvalRouter } from './gateway/approval/index.js'
+import { approverAdminRouter } from './gateway/approval/approvers-router.js'
 // G-D1: enforcement modes + policy simulation.
 import { simulationRouter, initModeConfigTable, initModeObservationsTable } from './gateway/simulation/index.js'
 import { dataClassificationRouter } from './gateway/data-classification/router.js'
@@ -1875,6 +1876,8 @@ app.use('/api/v1', authMiddleware, connectorsRouter)
 app.use('/api/v1', authMiddleware, guardsRouter)
 app.use('/api/v1', authMiddleware, automationsRouter)
 app.use('/api/v1', authMiddleware, playbooksRouter)
+// Approver management: tenant_admin key only (approvers-router.ts).
+app.use('/api/v1', authMiddleware, approverAdminRouter)
 app.use('/api/v1', authMiddleware, approvalRouter)
 app.use('/api/v1', authMiddleware, simulationRouter)
 app.use('/api/v1', authMiddleware, dataClassificationRouter)
