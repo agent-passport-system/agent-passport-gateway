@@ -32,7 +32,7 @@
  */
 
 import { Router } from 'express'
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { getDB } from '../../db/schema.js'
 import { getEventBus } from '../events.js'
@@ -45,9 +45,13 @@ import {
 import {
   initApprovalTables, insertRequest, getRequest, listRequests, decideRequest,
   expirePastDue, insertSignature, getSignatures, insertSample, getSample,
-  getReceipt, type ApprovalRequestRow,
+  getReceipt, parseStoredTime, type ApprovalRequestRow,
 } from './store.js'
 import { issueApprovalReceipt, emitApprovalSet } from './receipts.js'
+import {
+  approvalCommitment, verifyApproverSignature, approverKeyId, approverEvidenceDigest,
+} from './commitment.js'
+import { getActiveApprover } from './approvers.js'
 import { getApprovalConnectorRouter } from './connector.js'
 
 // v2 pure-logic helpers (consume, do not re-implement). These keep
@@ -96,10 +100,6 @@ const approvalLimiter = new RateLimiterMemory({
   keyPrefix: 'approval',
 })
 
-function keyHash(pub: string): string {
-  return createHash('sha256').update(pub).digest('hex').slice(0, 16)
-}
-
 /** Resolve the owner (principal) of an agent within a tenant. Agents are
  *  tenant-scoped; the owner is the tenant principal unless the agent row
  *  carries an explicit entity_id. Used for the approver-outside-owner rule. */
@@ -111,6 +111,15 @@ function resolveAgentOwner(tenantId: string, agentId: string): string | null {
   if (!row) return null
   // Owner identity = explicit entity_id if present, else the tenant id.
   return row.entity_id || tenantId
+}
+
+/** The agent's own registered public key, so an approver key equal to it
+ *  (the agent approving itself) can be refused. */
+function agentPublicKey(tenantId: string, agentId: string): string | null {
+  const row = getDB().prepare(
+    `SELECT public_key FROM agents WHERE tenant_id = ? AND agent_id = ?`
+  ).get(tenantId, agentId) as { public_key: string } | undefined
+  return row?.public_key ? String(row.public_key).toLowerCase() : null
 }
 
 function sweepExpired(tenantId: string): void {
@@ -276,14 +285,22 @@ approvalRouter.get('/approvals/:id', (req: any, res) => {
   if (!row) return res.status(404).json({ error: 'Approval request not found' })
   const signatures = getSignatures(tenant.id, req.params.id)
   const sample = getSample(tenant.id, req.params.id)
-  res.json({ ...row, signatures, sample })
+  // The exact message an approver signs (commitment.ts).
+  const c = approvalCommitment(row)
+  const commitment = { scheme: c.scheme, message: c.message, digest: c.digest }
+  res.json({ ...row, signatures, sample, commitment })
 })
 
 // ═══════════════════════════════════════
 // POST /approvals/:id/sign - an approver signs
-// Scoped-authority gated: approver must hold authority for the action
-// class; high-risk requires approver outside the agent owner and forbids
-// bulk; reason required; rubber-stamping blocked.
+// The approver is resolved from the approver registry (approvers.ts) and
+// must present an Ed25519 signature, under its registered key, over the
+// request commitment (commitment.ts). Body approver_public_key, authority,
+// key_class, office_id and decision_latency_ms are not read: identity,
+// key, authority and office come from the registry and the review
+// interval is measured by the server. Then the scoped-authority gate:
+// authority match; high-risk requires an approver outside the agent owner
+// and forbids bulk; reason required; rubber-stamping blocked.
 // ═══════════════════════════════════════
 approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
   bootstrap()
@@ -299,55 +316,85 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
     return res.status(409).json({ error: 'Request has expired' })
   }
 
-  const {
-    approver_id, approver_public_key, key_class, office_id, reason,
-    authority, batch_size, decision_latency_ms,
-  } = req.body || {}
+  const { approver_id, reason, signature, batch_size } = req.body || {}
 
-  if (!approver_id || !approver_public_key || !reason) {
-    return res.status(400).json({
-      error: 'Required: approver_id, approver_public_key, reason',
-    })
+  if (!approver_id || !reason) {
+    return res.status(400).json({ error: 'Required: approver_id, reason, signature' })
+  }
+  if (typeof signature !== 'string' || signature.length === 0) {
+    return res.status(400).json({ error: 'Required: signature', code: 'signature_required' })
   }
   // Rule 5: a reason is required and must be substantive.
   if (typeof reason !== 'string' || reason.trim().length < 3) {
     return res.status(400).json({ error: 'A substantive reason is required' })
   }
 
+  // Approver principal, key and authority from the registry only.
+  const approver = getActiveApprover(tenant.id, String(approver_id))
+  if (!approver) {
+    return res.status(403).json({
+      error: 'Approver is not registered for this tenant', code: 'approver_not_registered',
+    })
+  }
+
+  // The signature must verify under the registered key over this request's
+  // commitment. A signature over any other request content fails here.
+  const commitment = approvalCommitment(row)
+  if (!verifyApproverSignature(commitment, signature, approver.public_key)) {
+    return res.status(403).json({
+      error: 'Approver signature does not verify over the request commitment',
+      code: 'approver_signature_invalid',
+    })
+  }
+
   const tier = row.risk_tier as RiskTier
   const batchSize = typeof batch_size === 'number' && batch_size > 0 ? batch_size : 1
 
-  // Scoped-authority gate (policy.ts): authority match, outside-owner on
-  // high-risk, no bulk on high-risk.
+  // The agent approving itself with its own key is self-approval too.
+  if (isHighRiskTier(tier) && agentPublicKey(tenant.id, row.agent_id) === approver.public_key) {
+    return res.status(403).json({
+      error: 'High-risk approval requires an approver outside the agent owner',
+      code: 'self_approval_high_risk',
+    })
+  }
+
+  // Scoped-authority gate (policy.ts) against the resolved approver.
   const scopeCheck = checkScopedAuthority({
     actionClass: row.action_class,
     tier,
-    approverAuthority: Array.isArray(authority) ? authority.map(String) : [],
-    approverId: approver_id,
+    approverAuthority: approver.authority,
+    approverId: approver.approver_id,
+    approverPrincipalId: approver.principal_id,
     agentOwnerId: row.agent_owner_id,
+    ownerAliases: [row.requested_by],
     batchSize,
   })
   if (!scopeCheck.allowed) {
     return res.status(403).json({ error: scopeCheck.reason, code: scopeCheck.code })
   }
 
-  // Anti rubber-stamp: record this decision and block if the approver is
-  // rubber-stamping or deciding faster than a human can read.
-  const latency = typeof decision_latency_ms === 'number' ? decision_latency_ms : 60000
+  // Anti rubber-stamp. The latency is server-measured: from the request's
+  // created_at (written by this server at open) to this signature's arrival.
+  // It bounds the review window from above; it cannot prove the approver
+  // read the request, but it does stop instant scripted sign-offs, and the
+  // caller can no longer supply the number.
+  const nowMs = Date.now()
+  const openedMs = parseStoredTime(row.created_at)
+  const latency = Number.isFinite(openedMs) ? Math.max(0, nowMs - openedMs) : 0
   const fatigueRecord = {
     id: randomUUID(),
-    principal_id: approver_id,
+    principal_id: approver.approver_id,
     agent_id: row.agent_id,
     intent_id: row.id,
     decision: 'approved' as const,
     decision_latency_ms: latency,
     risk_class: tier,
     intent_complexity: isHighRiskTier(tier) ? 0.8 : 0.2,
-    timestamp: new Date().toISOString(),
+    timestamp: new Date(nowMs).toISOString(),
   }
   recordApproval(fatigueRecord)
   const impossible = checkImpossibleLatency(fatigueRecord)
-  const rubber = checkRubberStamping(approver_id)
+  const rubber = checkRubberStamping(approver.approver_id)
   if (impossible || rubber) {
     return res.status(429).json({
       error: 'Approval blocked: rubber-stamping or impossible-latency pattern detected',
@@ -355,20 +402,18 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
     })
   }
 
-  // Persist the signature. The signature string is supplied by the approver
-  // (Ed25519 over the canonical approval content per the SDK model). The
-  // gateway stores it as evidence; the sink verifies.
+  // Persist the verified signature with the registry key and office.
   let sigId: string
   try {
     sigId = insertSignature({
       tenantId: tenant.id,
       requestId: row.id,
-      approverId: approver_id,
-      approverPublicKey: approver_public_key,
-      keyClass: key_class || 'approver',
-      officeId: office_id || null,
+      approverId: approver.approver_id,
+      approverPublicKey: approver.public_key,
+      keyClass: approver.key_class,
+      officeId: approver.office_id,
       reason,
-      signature: req.body.signature || '',
+      signature,
       decisionLatencyMs: latency,
     })
   } catch (e: any) {
@@ -378,7 +423,9 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
     throw e
   }
 
-  res.status(201).json({ signature_id: sigId, request_id: row.id })
+  res.status(201).json({
+    signature_id: sigId, request_id: row.id, commitment_digest: commitment.digest,
+  })
 })
 
 // ═══════════════════════════════════════
@@ -409,10 +456,34 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
     return res.status(409).json({ error: 'Cannot approve with zero approver signatures' })
   }
 
+  // Re-verify every stored signature against the commitment of the row as
+  // it is NOW, under the approver's current registry key. A row changed
+  // after signing, or a revoked or re-keyed approver, fails here.
+  const commitment = approvalCommitment(existing)
+  const verified: Array<{ approver_id: string; key_id: string; signature: string }> = []
+  let invalid = 0
+  for (const s of sigs) {
+    const reg = getActiveApprover(tenant.id, s.approver_id)
+    if (reg && reg.public_key === s.approver_public_key
+        && verifyApproverSignature(commitment, s.signature, reg.public_key)) {
+      verified.push({ approver_id: s.approver_id, key_id: approverKeyId(reg.public_key), signature: s.signature })
+    } else {
+      invalid++
+    }
+  }
+  if (verdict === 'approved' && invalid > 0) {
+    return res.status(409).json({
+      error: 'Approver evidence does not verify against the current request content',
+      code: 'approver_evidence_invalid', invalid_signatures: invalid,
+    })
+  }
+
   const now = new Date().toISOString()
   const { row, error } = decideRequest({
     tenantId: tenant.id, id: req.params.id, verdict,
     reason, decidedBy: decided_by, nowIso: now,
+    expectedCommitmentDigest: commitment.digest,
+    commitmentOf: (r) => approvalCommitment(r).digest,
   })
   if (error === 'not_found') return res.status(404).json({ error: 'Approval request not found' })
   if (error === 'expired') {
@@ -424,6 +495,12 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
       })
     } catch {}
     return res.status(409).json({ error: 'Request has expired' })
+  }
+  if (error === 'commitment_mismatch') {
+    return res.status(409).json({
+      error: 'Request content changed after approver evidence was verified',
+      code: 'approver_evidence_invalid',
+    })
   }
   if (error) return res.status(409).json({ error: `Cannot decide: ${error}` })
 
@@ -440,8 +517,10 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
     subject: decided.subject,
     subjectType: decided.subject_type,
     approvedScope: safeParseArray(decided.requested_scope),
-    approverKeyHashes: sigs.map(s => keyHash(s.approver_public_key)),
-    signatureCount: sigs.length,
+    approverKeyHashes: verified.map(v => v.key_id),
+    signatureCount: verified.length,
+    requestCommitment: commitment.digest,
+    approverEvidenceDigest: approverEvidenceDigest(commitment.digest, verified),
     sampled: !!sample && sample.sampled === 1,
     issuedAt: now,
   })

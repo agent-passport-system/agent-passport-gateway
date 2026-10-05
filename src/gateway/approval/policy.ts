@@ -142,6 +142,12 @@ export interface ScopeCheckInput {
   approverAuthority: readonly string[]
   /** Approver identity (tenant-scoped principal id). */
   approverId: string
+  /** Registry owner relationship of the approver (the principal it acts
+   *  for). Compared against the owner set alongside approverId. */
+  approverPrincipalId?: string
+  /** Further identities that count as the owner side for separation
+   *  (for example the requester). Never widens what is allowed. */
+  ownerAliases?: readonly string[]
   /** The agent whose action is being approved, and the agent OWNER
    *  (principal that owns the agent). For high-risk, approverId must
    *  differ from the owner. */
@@ -176,8 +182,11 @@ export function checkScopedAuthority(input: ScopeCheckInput): ScopeCheckResult {
 
   const highRisk = isHighRiskTier(input.tier)
 
-  // Rule 2: high-risk requires approver OUTSIDE the agent owner.
-  if (highRisk && input.approverId === input.agentOwnerId) {
+  // Rule 2: high-risk requires approver OUTSIDE the agent owner. Both the
+  // approver id and its registered principal must be outside the owner set.
+  const ownerSide = new Set([input.agentOwnerId, ...(input.ownerAliases ?? [])].filter(Boolean))
+  const approverSide = [input.approverId, input.approverPrincipalId].filter(Boolean) as string[]
+  if (highRisk && approverSide.some(x => ownerSide.has(x))) {
     return {
       allowed: false,
       code: 'self_approval_high_risk',

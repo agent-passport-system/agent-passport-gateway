@@ -19,6 +19,7 @@ import { createHash } from 'node:crypto'
 import { getGatewayIdentity } from '../identity.js'
 import type { RiskTier } from './policy.js'
 import { insertReceipt } from './store.js'
+import { APPROVAL_COMMITMENT_DOMAIN } from './commitment.js'
 
 /** Stable canonical JSON: object keys sorted, null/undefined dropped.
  *  Matches the gateway-side canonical form used by enforce.ts so the
@@ -50,8 +51,12 @@ export interface ApprovalReceiptInput {
   approvedScope: string[]
   /** Approver public keys that signed (hashed, not raw, on public body). */
   approverKeyHashes: string[]
-  /** How many valid signatures were collected vs required. */
+  /** How many approver signatures verified against the request commitment. */
   signatureCount: number
+  /** sha256 of the request commitment the approvers signed (commitment.ts). */
+  requestCommitment: string
+  /** Digest over the verified approver ids, key ids and signatures. */
+  approverEvidenceDigest: string
   /** Whether a review sample was pulled for this request. */
   sampled: boolean
   issuedAt: string
@@ -82,7 +87,9 @@ export function issueApprovalReceipt(input: ApprovalReceiptInput): ApprovalRecei
   // approver identities in the clear - only hashes and counts. The public
   // projection whitelist (receipt-projection.ts) is a second guard.
   const payload: Record<string, unknown> = {
-    schema_version: '1.0.0',
+    // 1.1.0: adds commitment_scheme, request_commitment and
+    // approver_evidence_digest; signature_count counts verified signatures.
+    schema_version: '1.1.0',
     proof_type: 'approval_receipt',
     request_id: input.requestId,
     action_class: input.actionClass,
@@ -93,6 +100,9 @@ export function issueApprovalReceipt(input: ApprovalReceiptInput): ApprovalRecei
     scope_hash: scopeHash,
     approvers_hash: approversHash,
     signature_count: input.signatureCount,
+    commitment_scheme: APPROVAL_COMMITMENT_DOMAIN,
+    request_commitment: input.requestCommitment,
+    approver_evidence_digest: input.approverEvidenceDigest,
     sampled: input.sampled,
     issued_at: input.issuedAt,
     // Claims discipline: this receipt SUPPORTS EVIDENCE FOR a scoped
@@ -123,6 +133,7 @@ export function issueApprovalReceipt(input: ApprovalReceiptInput): ApprovalRecei
     receiptHash,
     payload: JSON.stringify(payload),
     signature,
+    schemaVersion: payload.schema_version as string,
   })
 
   return { id, receiptHash, signature, payload }

@@ -26,6 +26,10 @@ import {
 import { projectPublicBody, PUBLIC_BODY_WHITELISTS } from '../src/gateway/receipt-projection.js'
 import { setApprovalConnectorRouter } from '../src/gateway/approval/connector.js'
 import { clearApprovalFatigueStores } from '../src/sdk-migrated/v2/approval-fatigue.js'
+import { registerApprover } from '../src/gateway/approval/approvers.js'
+import { approvalCommitment } from '../src/gateway/approval/commitment.js'
+import { getRequest } from '../src/gateway/approval/store.js'
+import { generateKeyPair, sign as edSign } from 'agent-passport-system'
 
 const TENANT = 'tenant-c3'
 const OWNER_ENTITY = 'entity-owner'
@@ -89,6 +93,27 @@ async function post(path: string, body: unknown) {
 async function get(path: string) {
   const r = await fetch(`${baseUrl}${path}`)
   return { status: r.status, json: await r.json() as any }
+}
+
+// Approvers are resolved from the registry and must sign the request
+// commitment with their registered key (approvers.ts, commitment.ts).
+type Kp = { publicKey: string; privateKey: string }
+function registerTestApprover(approverId: string, authority: string[], principalId = `principal-${approverId}`): Kp {
+  const kp = generateKeyPair()
+  registerApprover({
+    tenantId: TENANT, approverId, publicKey: kp.publicKey, authority,
+    principalId, registeredBy: 'test-operator',
+  })
+  return kp
+}
+function commitSig(requestId: string, kp: Kp): string {
+  return edSign(approvalCommitment(getRequest(TENANT, requestId)!).message, kp.privateKey)
+}
+/** Move created_at back so the server-measured review interval clears the
+ *  impossible-latency floor (created_at is not part of the commitment). */
+function backdate(requestId: string, ms = 60_000) {
+  getDB().prepare(`UPDATE approval_requests SET created_at = ? WHERE id = ?`)
+    .run(new Date(Date.now() - ms).toISOString(), requestId)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -186,10 +211,11 @@ describe('no bulk approvals for high-risk', () => {
     })
     assert.equal(created.status, 201)
     assert.equal(created.json.risk_tier, 'high')
+    const kp = registerTestApprover('outsider-bulk', ['payments:*'])
+    backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: 'outsider', approver_public_key: 'apk-1',
-      reason: 'reviewed the refund batch', authority: ['payments:*'],
-      batch_size: 12,
+      approver_id: 'outsider-bulk', reason: 'reviewed the refund batch',
+      signature: commitSig(created.json.id, kp), batch_size: 12,
     })
     assert.equal(signed.status, 403)
     assert.equal(signed.json.code, 'bulk_high_risk')
@@ -227,9 +253,11 @@ describe('approver-outside-owner for high-risk', () => {
     })
     assert.equal(created.status, 201)
     // The agent owner entity is OWNER_ENTITY; approver_id == owner => refuse.
+    const kp = registerTestApprover(OWNER_ENTITY, ['payments:*'], OWNER_ENTITY)
+    backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: OWNER_ENTITY, approver_public_key: 'apk-owner',
-      reason: 'I own this agent', authority: ['payments:*'], batch_size: 1,
+      approver_id: OWNER_ENTITY, reason: 'I own this agent',
+      signature: commitSig(created.json.id, kp), batch_size: 1,
     })
     assert.equal(signed.status, 403)
     assert.equal(signed.json.code, 'self_approval_high_risk')
@@ -240,9 +268,11 @@ describe('approver-outside-owner for high-risk', () => {
       action_class: 'payments:refund', subject: 'inv-3',
       agent_id: AGENT, requested_by: 'requester',
     })
+    const kp = registerTestApprover('outsider-1', ['payments:*'])
+    backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: 'outsider-1', approver_public_key: 'apk-outsider-1',
-      reason: 'verified payee and amount', authority: ['payments:*'], batch_size: 1,
+      approver_id: 'outsider-1', reason: 'verified payee and amount',
+      signature: commitSig(created.json.id, kp), batch_size: 1,
     })
     assert.equal(signed.status, 201)
     assert.ok(signed.json.signature_id)
@@ -253,9 +283,10 @@ describe('approver-outside-owner for high-risk', () => {
       action_class: 'payments:refund', subject: 'inv-4',
       agent_id: AGENT, requested_by: 'requester',
     })
+    const kp = registerTestApprover('outsider-2', ['payments:*'])
+    backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: 'outsider-2', approver_public_key: 'apk-outsider-2',
-      authority: ['payments:*'], batch_size: 1,
+      approver_id: 'outsider-2', signature: commitSig(created.json.id, kp), batch_size: 1,
     })
     assert.equal(signed.status, 400)
   })
@@ -308,10 +339,11 @@ describe('approval receipt issued', () => {
     })
     assert.equal(created.status, 201)
 
+    const kp = registerTestApprover('outsider-r', ['payments:*'])
+    backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: 'outsider-r', approver_public_key: 'apk-outsider-r',
-      reason: 'amount and payee verified against the invoice',
-      authority: ['payments:*'], batch_size: 1, signature: 'ed25519-sig',
+      approver_id: 'outsider-r', reason: 'amount and payee verified against the invoice',
+      batch_size: 1, signature: commitSig(created.json.id, kp),
     })
     assert.equal(signed.status, 201)
 
@@ -375,7 +407,7 @@ describe('approval receipt issued', () => {
 describe('isolation and lifecycle guards', () => {
   it('signing an unknown request id is 404', async () => {
     const signed = await post('/approvals/does-not-exist/sign', {
-      approver_id: 'a', approver_public_key: 'k', reason: 'x reason', authority: ['*'],
+      approver_id: 'a', reason: 'x reason', signature: '00',
     })
     assert.equal(signed.status, 404)
   })
@@ -391,14 +423,16 @@ describe('isolation and lifecycle guards', () => {
     const created = await post('/approvals', {
       action_class: 'read:files', subject: 'dup', agent_id: AGENT, requested_by: 'r',
     })
+    const kp = registerTestApprover('dup-app', ['read:*'])
+    backdate(created.json.id)
     const first = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: 'dup-app', approver_public_key: 'dup-key',
-      reason: 'first signature here', authority: ['read:*'],
+      approver_id: 'dup-app', reason: 'first signature here',
+      signature: commitSig(created.json.id, kp),
     })
     assert.equal(first.status, 201)
     const second = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: 'dup-app', approver_public_key: 'dup-key',
-      reason: 'second time same key', authority: ['read:*'],
+      approver_id: 'dup-app', reason: 'second time same key',
+      signature: commitSig(created.json.id, kp),
     })
     assert.equal(second.status, 409)
   })

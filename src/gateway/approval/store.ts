@@ -95,6 +95,25 @@ export function initApprovalTables(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_approval_sample_request ON approval_samples(tenant_id, request_id);
     CREATE INDEX IF NOT EXISTS idx_approval_sample_pending ON approval_samples(sampled, review_status);
+
+    -- Approver registry (approvers.ts). One key per approver per tenant,
+    -- and one approver per key, so a key cannot be re-registered under an
+    -- alias id.
+    CREATE TABLE IF NOT EXISTS approval_approvers (
+      tenant_id TEXT NOT NULL,
+      approver_id TEXT NOT NULL,
+      public_key TEXT NOT NULL,
+      authority TEXT NOT NULL,
+      principal_id TEXT NOT NULL,
+      key_class TEXT NOT NULL DEFAULT 'approver',
+      office_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      registered_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      revoked_at TEXT,
+      PRIMARY KEY (tenant_id, approver_id),
+      UNIQUE (tenant_id, public_key)
+    );
   `)
   _initialized = true
 }
@@ -136,18 +155,28 @@ export function insertRequest(row: {
 }): string {
   const db = getDB()
   const id = randomUUID()
+  // created_at is written with millisecond precision (ISO) because the
+  // server-side review interval in /sign is measured from it.
   db.prepare(`
     INSERT INTO approval_requests (
       id, tenant_id, sdk_request_id, action_class, subject, subject_type,
       risk_tier, requested_by, agent_id, agent_owner_id, requested_scope,
-      status, expires_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      status, created_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
   `).run(
     id, row.tenantId, row.sdkRequestId, row.actionClass, row.subject,
     row.subjectType, row.riskTier, row.requestedBy, row.agentId,
-    row.agentOwnerId, JSON.stringify(row.requestedScope), row.expiresAt,
+    row.agentOwnerId, JSON.stringify(row.requestedScope),
+    new Date().toISOString(), row.expiresAt,
   )
   return id
+}
+
+/** Parse a stored timestamp. New rows are ISO; rows written by the column
+ *  default are SQLite 'YYYY-MM-DD HH:MM:SS' in UTC. NaN when unparseable. */
+export function parseStoredTime(s: string | null | undefined): number {
+  if (!s) return NaN
+  return s.includes('T') ? Date.parse(s) : Date.parse(s.replace(' ', 'T') + 'Z')
 }
 
 export function getRequest(tenantId: string, id: string): ApprovalRequestRow | undefined {
@@ -169,8 +198,11 @@ export function listRequests(tenantId: string, status?: string, limit = 50): App
 }
 
 /** Decide a request (approve|reject). Atomic + status-guarded: only a
- *  pending, non-expired request may be decided. Returns the updated row
- *  or null with an error code. */
+ *  pending, non-expired request may be decided. When commitmentOf and
+ *  expectedCommitmentDigest are given, the row read inside the transaction
+ *  must still produce that commitment, so the content the approvers'
+ *  signatures were verified against is the content being decided.
+ *  Returns the updated row or null with an error code. */
 export function decideRequest(opts: {
   tenantId: string
   id: string
@@ -178,6 +210,8 @@ export function decideRequest(opts: {
   reason: string
   decidedBy: string
   nowIso: string
+  expectedCommitmentDigest?: string
+  commitmentOf?: (row: ApprovalRequestRow) => string
 }): { row: ApprovalRequestRow | null; error?: string } {
   const db = getDB()
   return db.transaction(() => {
@@ -187,6 +221,10 @@ export function decideRequest(opts: {
     if (!row) return { row: null, error: 'not_found' }
     if (row.status !== 'pending') return { row, error: `not_pending:${row.status}` }
     if (row.expires_at <= opts.nowIso) return { row, error: 'expired' }
+    if (opts.expectedCommitmentDigest !== undefined && opts.commitmentOf
+        && opts.commitmentOf(row) !== opts.expectedCommitmentDigest) {
+      return { row, error: 'commitment_mismatch' }
+    }
     db.prepare(`
       UPDATE approval_requests
       SET status = ?, decision_reason = ?, decided_by = ?, decided_at = ?
@@ -292,17 +330,18 @@ export function insertReceipt(row: {
   receiptHash: string
   payload: string
   signature: string | null
+  schemaVersion?: string
 }): string {
   const db = getDB()
   const id = randomUUID()
   db.prepare(`
     INSERT INTO approval_receipts (
       id, tenant_id, request_id, action_class, risk_tier, verdict,
-      receipt_hash, payload, signature
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      schema_version, receipt_hash, payload, signature
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, row.tenantId, row.requestId, row.actionClass, row.riskTier,
-    row.verdict, row.receiptHash, row.payload, row.signature,
+    row.verdict, row.schemaVersion ?? '1.0.0', row.receiptHash, row.payload, row.signature,
   )
   return id
 }
