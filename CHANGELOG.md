@@ -17,16 +17,17 @@ action class and `requested_scope` were. Encode limits in `requested_scope` inst
   key, authority, key class and office come from the registry.
 - `signature` is required: an Ed25519 signature, under the registered key, over the
   request commitment that `GET /api/v1/approvals/:id` returns as `commitment.message`.
-- `approver_public_key`, `authority`, `key_class`, `office_id` and `decision_latency_ms`
-  in the body answer `400 {code: "server_bound_field", fields: [...]}`.
-- `batch_size` is no longer read. One `/sign` call signs one request, so the gateway
-  treats every signature as a batch of 1.
+- `approver_public_key`, `authority`, `key_class`, `office_id`, `decision_latency_ms`
+  and `batch_size` in the body answer `400 {code: "server_bound_field", fields: [...]}`.
+  One `/sign` call is one signature over one request commitment, so the batch is not
+  the caller's to state.
 - Elapsed time between opening and signing is no longer a reason to refuse: the
   `latency_impossible` 429 is gone. The gateway stores the server-measured request age
   on the signature row (`elapsed_since_open_ms`) as telemetry. It is not a measure of
   review or reading time.
-- The success body adds `fatigue_flag` (`null` or `"rubber_stamping"`). It reports the
-  rubber-stamp pattern over the approver's accepted signatures and does not block.
+- The rubber-stamp check no longer runs on `/sign`, and the success body has no
+  `fatigue_flag`. On this route its only discriminating input was the request age,
+  which is not review time. The 429 it used to return is gone.
 - For high-risk tiers the approver must not be registered as the agent owner, the
   agent itself, or the API key that opened the request, and must not hold the agent's
   key. The body `requested_by` label is no longer part of that check. The check
@@ -42,6 +43,15 @@ action class and `requested_scope` were. Encode limits in `requested_scope` inst
 - `POST /api/v1/approvers`, `GET /api/v1/approvers` and
   `POST /api/v1/approvers/:approver_id/revoke` accept only an unexpired `tenant_admin`
   key of the same tenant. A runtime key gets `403 {code: "tenant_admin_required"}`.
+- A `tenant_admin` key works only on those three routes and on `GET /api/v1/account`.
+  Every other route answers `403 {code: "tenant_admin_scope"}`. That includes approval
+  open, sign, decide and receipt and `rotate-key` and `regenerate-key`, so an admin key
+  cannot mint, rotate or renew a runtime key.
+- A `tenant_admin` key whose stored expiry is missing or unparseable is refused with
+  401. Runtime keys with no expiry are unaffected.
+- Each successful issuance sends one security notice to the account email: account,
+  time, action and expiry, and what to do if it was not the owner. It never contains
+  the key.
 - Approver `authority` is a list of 1 to 32 action-class entries (`payments:refund`,
   `payments`, `payments:*`). A bare `*` or any other wildcard answers
   `400 {code: "authority_wildcard"}`, more than 32 entries
@@ -51,9 +61,16 @@ action class and `requested_scope` were. Encode limits in `requested_scope` inst
   Password reset still revokes every key, tenant admin keys included.
   `GET /api/v1/account` lists `key_class` and `expires_at` per key.
 
+**Fixed: approver revocation during decide.** `decide` now reads the signatures and the
+approver registry inside the same database transaction that records the decision. A
+revocation committed by another process while a decide was in flight could be missed
+before, and the request approved on the revoked approver's signature.
+
 **Migration notes.**
 
 - Every existing API key is a runtime key with no expiry.
+- A `tenant_admin` row with no expiry, which only an unreleased build of this branch
+  could write, no longer authenticates.
 - No approvers are registered for any tenant. Until a tenant admin registers one,
   `/sign` answers `403 approver_not_registered`.
 - Pending requests signed before this change hold signatures that were never verified.
