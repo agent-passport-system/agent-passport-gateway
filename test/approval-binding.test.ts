@@ -395,3 +395,33 @@ describe('revocation cascade preview counts pending approvals', () => {
     assert.ok(pv.recommendedActions.includes('schedule'))
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Unbindable authority-relevant fields are rejected, not dropped
+// ─────────────────────────────────────────────────────────────────────
+
+describe('unbindable fields', () => {
+  it('open with amount, currency, params or target is 400 unbindable_field', async () => {
+    for (const extra of [{ amount: 100 }, { currency: 'USD' }, { params: { to: 'acct-A' } }, { target: 'acct-A' }]) {
+      const r = await call('POST', '/approvals', {
+        action_class: 'payments:transfer', subject: 'inv-u', agent_id: AGENT, requested_by: 'requester-1', ...extra,
+      })
+      assert.equal(r.status, 400, JSON.stringify(extra))
+      assert.equal(r.json.code, 'unbindable_field')
+      assert.deepEqual(r.json.fields, Object.keys(extra))
+    }
+  })
+
+  it('sign and decide bodies carrying them are refused too', async () => {
+    const a = approver(['payments:*'])
+    const id = await open(); backdate(id)
+    const s = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp), amount: 999999 })
+    assert.equal(s.status, 400)
+    assert.equal(s.json.code, 'unbindable_field')
+    assert.equal((await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })).status, 201)
+    const d = await call('POST', `/approvals/${id}/decide`, { verdict: 'approved', reason: 'looks right', decided_by: 'ops', params: { to: 'acct-B' } })
+    assert.equal(d.status, 400)
+    assert.equal(d.json.code, 'unbindable_field')
+    assert.equal(getRequest(TENANT, id)!.status, 'pending')
+  })
+})

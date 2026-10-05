@@ -122,6 +122,22 @@ function agentPublicKey(tenantId: string, agentId: string): string | null {
   return row?.public_key ? String(row.public_key).toLowerCase() : null
 }
 
+/** Authority-relevant fields an approval cannot bind: nothing stores them,
+ *  the commitment does not cover them and the receipt does not carry them.
+ *  Silently dropping them would let a caller believe "transfer of 100 to
+ *  acct-A" was approved when only the action class and scope were. */
+const UNBINDABLE_FIELDS = ['amount', 'currency', 'params', 'target'] as const
+
+function rejectUnbindable(body: any, res: any): boolean {
+  const present = UNBINDABLE_FIELDS.filter(f => body && Object.prototype.hasOwnProperty.call(body, f))
+  if (present.length === 0) return false
+  res.status(400).json({
+    error: `Fields not bound by an approval: ${present.join(', ')}. Encode limits in requested_scope.`,
+    code: 'unbindable_field', fields: present,
+  })
+  return true
+}
+
 function sweepExpired(tenantId: string): void {
   const expired = expirePastDue(tenantId, new Date().toISOString())
   for (const r of expired) {
@@ -144,6 +160,7 @@ approvalRouter.post('/approvals', async (req: any, res) => {
   try { await approvalLimiter.consume(tenant.id) } catch {
     return res.status(429).json({ error: 'Rate limit exceeded' })
   }
+  if (rejectUnbindable(req.body, res)) return
 
   const {
     action_class, subject, subject_type, agent_id, requested_by,
@@ -316,6 +333,7 @@ approvalRouter.post('/approvals/:id/sign', (req: any, res) => {
     return res.status(409).json({ error: 'Request has expired' })
   }
 
+  if (rejectUnbindable(req.body, res)) return
   const { approver_id, reason, signature, batch_size } = req.body || {}
 
   if (!approver_id || !reason) {
@@ -436,6 +454,7 @@ approvalRouter.post('/approvals/:id/decide', (req: any, res) => {
   const tenant: Tenant = req.tenant
   sweepExpired(tenant.id)
 
+  if (rejectUnbindable(req.body, res)) return
   const { verdict, reason, decided_by } = req.body || {}
   if (verdict !== 'approved' && verdict !== 'rejected') {
     return res.status(400).json({ error: 'verdict must be "approved" or "rejected"' })
