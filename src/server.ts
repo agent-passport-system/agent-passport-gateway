@@ -169,11 +169,11 @@ app.get('/index.html', (_req, res) => res.redirect(301, `${APP_ORIGIN}/portal.ht
 
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
-  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.4.0' })
+  res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.4.1' })
 })
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', version: '0.4.0', uptime_seconds: Math.floor(process.uptime()), timestamp: new Date().toISOString() })
+  res.json({ status: 'ok', version: '0.4.1', uptime_seconds: Math.floor(process.uptime()), timestamp: new Date().toISOString() })
 })
 
 app.get('/api/v1/status', (_req, res) => {
@@ -181,7 +181,7 @@ app.get('/api/v1/status', (_req, res) => {
   try { getDB().prepare('SELECT 1').get(); dbWritable = true } catch {}
   res.json({
     gateway: 'operational',
-    version: '0.4.0',
+    version: '0.4.1',
     uptime_seconds: Math.floor(process.uptime()),
     database: dbWritable ? 'connected' : 'error',
     timestamp: new Date().toISOString(),
@@ -1810,7 +1810,7 @@ try {
 
 console.log(`
 ═══════════════════════════════════════
-  AEOESS Gateway v0.4.0 (Railway)
+  AEOESS Gateway v0.4.1 (Railway)
   Port: ${PORT}
   Database: ${DB_PATH}
   Endpoints: 40 API routes + 2 public (.well-known)

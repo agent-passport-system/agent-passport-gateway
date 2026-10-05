@@ -194,7 +194,7 @@ export async function toPdf(
         Title: `AEOESS Audit Report - ${tenantId}`,
         Author: 'AEOESS Gateway',
         Subject: 'Audit Log Export',
-        Creator: 'AEOESS Gateway v0.4.0',
+        Creator: 'AEOESS Gateway v0.4.1',
       },
     })
 

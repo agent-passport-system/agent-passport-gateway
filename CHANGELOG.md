@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (2026-10-05)
 
 **BREAKING: scoped approvals refuse fields they cannot bind.** `POST /api/v1/approvals`,
 `POST /api/v1/approvals/:id/sign` and `POST /api/v1/approvals/:id/decide` answer
