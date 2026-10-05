@@ -30,14 +30,14 @@ action class and `requested_scope` were. Encode limits in `requested_scope` inst
 - For high-risk tiers the approver must not be registered as the agent owner, the
   agent itself, or the API key that opened the request, and must not hold the agent's
   key. The body `requested_by` label is no longer part of that check. The check
-  compares registered identities and keys; it does not prove that a separate person
+  compares registered identities and keys. It does not prove that a separate person
   holds the approver key.
 
 **New: tenant admin credential and approver registry routes.**
 
 - `POST /auth/tenant-admin/issue` with the account owner's `email` and `password`
   returns a `tenant_admin` API key that expires 15 minutes after issuance. It cannot be
-  renewed with any API key; issue a new one with the password. Ordinary login, signup,
+  renewed with any API key. Issue a new one with the password. Ordinary login, signup,
   GitHub OAuth and key rotation still return runtime keys only.
 - `POST /api/v1/approvers`, `GET /api/v1/approvers` and
   `POST /api/v1/approvers/:approver_id/revoke` accept only an unexpired `tenant_admin`
@@ -45,7 +45,7 @@ action class and `requested_scope` were. Encode limits in `requested_scope` inst
 - Approver `authority` is a list of 1 to 32 action-class entries (`payments:refund`,
   `payments`, `payments:*`). A bare `*` or any other wildcard answers
   `400 {code: "authority_wildcard"}`, more than 32 entries
-  `400 {code: "authority_too_many"}`. There is no update route; revoke and register a
+  `400 {code: "authority_too_many"}`. There is no update route. Revoke and register a
   new approver id to change authority.
 - `POST /api/v1/account/rotate-key` and `regenerate-key` now revoke runtime keys only.
   Password reset still revokes every key, tenant admin keys included.
@@ -57,7 +57,7 @@ action class and `requested_scope` were. Encode limits in `requested_scope` inst
 - No approvers are registered for any tenant. Until a tenant admin registers one,
   `/sign` answers `403 approver_not_registered`.
 - Pending requests signed before this change hold signatures that were never verified.
-  Approving them answers `409 approver_evidence_invalid`; they need re-signing by a
+  Approving them answers `409 approver_evidence_invalid`, and they need re-signing by a
   registered approver.
 - Approval receipts issued from now on use payload schema `1.1.0` with
   `request_commitment` and `approver_evidence_digest`. Both are in the full receipt on
