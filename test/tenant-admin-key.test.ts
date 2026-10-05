@@ -1,14 +1,19 @@
 // Copyright 2024-2026 Tymofii Pidlisnyi. Apache-2.0 license. See LICENSE.
 // API key class: runtime vs tenant_admin.
 //
-//   - a DB created before the key_class column migrates every existing key
-//     to runtime
-//   - createTenant and default issueApiKey mint runtime keys
-//   - only issueApiKey(..., 'tenant_admin') mints a tenant_admin key
-//   - authenticateKey reports the presenting key's class and id
+//   - a DB created before the key_class / expires_at columns migrates every
+//     existing key to runtime with no expiry
+//   - createTenant and issueApiKey (signup, login) mint runtime keys only
+//   - a tenant_admin key comes only from POST /auth/tenant-admin/issue with
+//     the account password, expires after TENANT_ADMIN_TTL_MS, and an
+//     expired one is refused by authenticateKey
+//   - no API key can mint or renew one: the issuance route reads only
+//     email + password
+//   - runtime rotation (rotateRuntimeKeys, used by rotate-key and
+//     regenerate-key) leaves an unexpired tenant_admin key working
+//   - password reset (revokeAllApiKeysForTenant) revokes it
 //   - requireTenantAdmin refuses runtime keys, including a platform
 //     operator's runtime key (role=admin is a different authority)
-//   - parseLoginKeyClass accepts only runtime or tenant_admin
 
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -16,16 +21,27 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { unlinkSync } from 'node:fs'
 import { randomUUID, randomBytes, createHash } from 'node:crypto'
+import type { Server } from 'node:http'
+import express from 'express'
 import Database from 'better-sqlite3'
 import { initDB, getDB } from '../src/db/schema.js'
-import { createTenant, authenticateKey, requireTenantAdmin } from '../src/auth/api-keys.js'
-import { issueApiKey, parseLoginKeyClass } from '../src/auth/email-password.js'
+import { createTenant, authenticateKey, requireTenantAdmin, authMiddleware } from '../src/auth/api-keys.js'
+import {
+  issueApiKey, hashPassword, setTenantPassword, revokeAllApiKeysForTenant,
+  createPasswordResetToken, consumePasswordResetToken,
+} from '../src/auth/email-password.js'
+import {
+  issueTenantAdminKey, rotateRuntimeKeys, tenantAdminRouter, TENANT_ADMIN_TTL_MS,
+} from '../src/auth/tenant-admin.js'
 
 let dbPath: string
+let server: Server
+let baseUrl: string
 const LEGACY_TENANT = 'tenant-legacy'
 const LEGACY_KEY = `aps_live_${randomBytes(32).toString('hex')}`
+const PASSWORD = 'correct horse battery staple'
 
-before(() => {
+before(async () => {
   // Seed a DB file with the pre-key_class api_keys schema and one key.
   dbPath = join(tmpdir(), `aeoess-key-class-test-${randomUUID()}.db`)
   const old = new Database(dbPath)
@@ -49,12 +65,40 @@ before(() => {
     .run('legacy-key-row', LEGACY_TENANT, createHash('sha256').update(LEGACY_KEY).digest('hex'), LEGACY_KEY.slice(0, 12), 'default')
   old.close()
   initDB(dbPath)
+
+  const app = express()
+  app.use(express.json())
+  app.use(tenantAdminRouter)
+  app.get('/api/v1/whoami', authMiddleware, (req: any, res) => res.json({ id: req.tenant.id, key_class: req.tenant.key_class }))
+  await new Promise<void>((r) => {
+    server = app.listen(0, '127.0.0.1', () => {
+      baseUrl = `http://127.0.0.1:${(server.address() as any).port}`
+      r()
+    })
+  })
 })
 
 after(() => {
+  server?.close()
   try { getDB().close() } catch {}
   for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) { try { unlinkSync(f) } catch {} }
 })
+
+async function call(method: string, path: string, body?: unknown, key?: string) {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (key) headers.authorization = `Bearer ${key}`
+  const r = await fetch(`${baseUrl}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
+  let json: any = null
+  try { json = await r.json() } catch { json = null }
+  return { status: r.status, json }
+}
+
+async function tenantWithPassword(): Promise<{ id: string; email: string; runtimeKey: string }> {
+  const email = `ta-${randomUUID()}@test.local`
+  const { tenant, apiKey } = createTenant({ name: 'n', email })
+  setTenantPassword(tenant.id, await hashPassword(PASSWORD))
+  return { id: tenant.id, email, runtimeKey: apiKey }
+}
 
 function runMiddleware(tenant: any) {
   let status = 0
@@ -69,9 +113,10 @@ function runMiddleware(tenant: any) {
 }
 
 describe('api key class', () => {
-  it('a key that existed before the migration becomes runtime', () => {
-    const row = getDB().prepare(`SELECT key_class FROM api_keys WHERE id = 'legacy-key-row'`).get() as any
+  it('a key that existed before the migration becomes runtime with no expiry', () => {
+    const row = getDB().prepare(`SELECT key_class, expires_at FROM api_keys WHERE id = 'legacy-key-row'`).get() as any
     assert.equal(row.key_class, 'runtime')
+    assert.equal(row.expires_at, null)
     const t = authenticateKey(LEGACY_KEY)
     assert.ok(t)
     assert.equal(t!.id, LEGACY_TENANT)
@@ -79,21 +124,11 @@ describe('api key class', () => {
     assert.equal(t!.key_id, 'legacy-key-row')
   })
 
-  it('createTenant and default issueApiKey mint runtime keys', () => {
+  it('createTenant and issueApiKey (signup, login) mint runtime keys only', () => {
     const { tenant, apiKey } = createTenant({ name: 'n', email: `kc-${randomUUID()}@test.local` })
     assert.equal(authenticateKey(apiKey)!.key_class, 'runtime')
     const second = issueApiKey(tenant.id, 'email-login-1')
     assert.equal(authenticateKey(second)!.key_class, 'runtime')
-  })
-
-  it('issueApiKey with tenant_admin mints a tenant_admin key for that tenant only', () => {
-    const { tenant } = createTenant({ name: 'n', email: `kc-${randomUUID()}@test.local` })
-    const adminKey = issueApiKey(tenant.id, 'tenant-admin-1', 'tenant_admin')
-    const t = authenticateKey(adminKey)!
-    assert.equal(t.id, tenant.id)
-    assert.equal(t.key_class, 'tenant_admin')
-    const row = getDB().prepare(`SELECT key_class, name FROM api_keys WHERE id = ?`).get(t.key_id) as any
-    assert.equal(row.key_class, 'tenant_admin')
   })
 
   it('requireTenantAdmin: runtime key 403, tenant_admin key passes, missing tenant 401', () => {
@@ -101,16 +136,10 @@ describe('api key class', () => {
     assert.equal(rt.status, 403)
     assert.equal(rt.body.code, 'tenant_admin_required')
     assert.equal(rt.nextCalled, false)
-
-    const legacyShape = runMiddleware({ id: 't', role: 'user' })
-    assert.equal(legacyShape.status, 403, 'no key_class means runtime')
-
+    assert.equal(runMiddleware({ id: 't', role: 'user' }).status, 403, 'no key_class means runtime')
     const ok = runMiddleware({ id: 't', role: 'user', key_class: 'tenant_admin' })
     assert.equal(ok.nextCalled, true)
-    assert.equal(ok.status, 0)
-
-    const none = runMiddleware(undefined)
-    assert.equal(none.status, 401)
+    assert.equal(runMiddleware(undefined).status, 401)
   })
 
   it('platform operator role does not satisfy requireTenantAdmin', () => {
@@ -118,14 +147,100 @@ describe('api key class', () => {
     assert.equal(op.status, 403)
     assert.equal(op.nextCalled, false)
   })
+})
 
-  it('parseLoginKeyClass accepts runtime (default) and tenant_admin only', () => {
-    assert.equal(parseLoginKeyClass(undefined), 'runtime')
-    assert.equal(parseLoginKeyClass(null), 'runtime')
-    assert.equal(parseLoginKeyClass('runtime'), 'runtime')
-    assert.equal(parseLoginKeyClass('tenant_admin'), 'tenant_admin')
-    assert.equal(parseLoginKeyClass('admin'), null)
-    assert.equal(parseLoginKeyClass('TENANT_ADMIN'), null)
-    assert.equal(parseLoginKeyClass(['tenant_admin']), null)
+describe('tenant_admin issuance (POST /auth/tenant-admin/issue)', () => {
+  it('issues a tenant_admin key that expires TENANT_ADMIN_TTL_MS (15 min) after issuance', async () => {
+    assert.equal(TENANT_ADMIN_TTL_MS, 15 * 60 * 1000)
+    const t = await tenantWithPassword()
+    const before = Date.now()
+    const r = await call('POST', '/auth/tenant-admin/issue', { email: t.email, password: PASSWORD })
+    const after = Date.now()
+    assert.equal(r.status, 201, JSON.stringify(r.json))
+    assert.equal(r.json.key_class, 'tenant_admin')
+    assert.equal(r.json.ttl_seconds, 900)
+    const exp = Date.parse(r.json.expires_at)
+    assert.ok(exp >= before + TENANT_ADMIN_TTL_MS && exp <= after + TENANT_ADMIN_TTL_MS)
+    const who = await call('GET', '/api/v1/whoami', undefined, r.json.api_key)
+    assert.equal(who.status, 200)
+    assert.deepEqual(who.json, { id: t.id, key_class: 'tenant_admin' })
+    const row = getDB().prepare(`SELECT key_class, expires_at FROM api_keys WHERE key_hash = ?`)
+      .get(createHash('sha256').update(r.json.api_key).digest('hex')) as any
+    assert.equal(row.key_class, 'tenant_admin')
+    assert.equal(row.expires_at, r.json.expires_at)
+  })
+
+  it('wrong password, unknown email or a missing password is 401 and mints nothing', async () => {
+    const t = await tenantWithPassword()
+    const count = () => (getDB().prepare(`SELECT COUNT(*) c FROM api_keys WHERE tenant_id = ?`).get(t.id) as any).c
+    const n = count()
+    for (const body of [
+      { email: t.email, password: 'wrong password here' },
+      { email: `nobody-${randomUUID()}@test.local`, password: PASSWORD },
+      { email: t.email },
+    ]) {
+      const r = await call('POST', '/auth/tenant-admin/issue', body)
+      assert.equal(r.status, 401, JSON.stringify(body))
+    }
+    assert.equal(count(), n)
+  })
+
+  it('a runtime key cannot mint or renew one: the bearer key is not a credential here', async () => {
+    const t = await tenantWithPassword()
+    const viaRuntime = await call('POST', '/auth/tenant-admin/issue', {}, t.runtimeKey)
+    assert.equal(viaRuntime.status, 401)
+    const admin = issueTenantAdminKey(t.id)
+    const viaAdmin = await call('POST', '/auth/tenant-admin/issue', {}, admin.apiKey)
+    assert.equal(viaAdmin.status, 401, 'an admin key cannot renew itself either')
+    const admins = getDB().prepare(`SELECT COUNT(*) c FROM api_keys WHERE tenant_id = ? AND key_class = 'tenant_admin'`).get(t.id) as any
+    assert.equal(admins.c, 1)
+  })
+
+  it('an expired tenant_admin key is refused server-side', async () => {
+    const t = await tenantWithPassword()
+    const stale = issueTenantAdminKey(t.id, Date.now() - TENANT_ADMIN_TTL_MS - 1)
+    assert.equal(authenticateKey(stale.apiKey), null)
+    const r = await call('GET', '/api/v1/whoami', undefined, stale.apiKey)
+    assert.equal(r.status, 401)
+    // And one that expires while held.
+    const live = issueTenantAdminKey(t.id)
+    assert.equal(authenticateKey(live.apiKey)!.key_class, 'tenant_admin')
+    getDB().prepare(`UPDATE api_keys SET expires_at = ? WHERE id = ?`).run(new Date(Date.now() - 1).toISOString(), live.keyId)
+    assert.equal(authenticateKey(live.apiKey), null)
+  })
+})
+
+describe('rotation and recovery', () => {
+  it('runtime rotation revokes runtime keys only and leaves an unexpired tenant_admin key working', async () => {
+    const t = await tenantWithPassword()
+    const extraRuntime = issueApiKey(t.id, 'email-login-x')
+    const admin = issueTenantAdminKey(t.id)
+    const rotated = rotateRuntimeKeys(t.id, 'rotated')
+    assert.equal(rotated.revoked, 2)
+    assert.equal(authenticateKey(t.runtimeKey), null)
+    assert.equal(authenticateKey(extraRuntime), null)
+    assert.equal(authenticateKey(rotated.apiKey)!.key_class, 'runtime')
+    assert.equal(authenticateKey(admin.apiKey)!.key_class, 'tenant_admin', 'admin key survives rotation')
+    // regenerate-key uses the same function.
+    const regen = rotateRuntimeKeys(t.id, 'regenerated')
+    assert.equal(regen.revoked, 1)
+    assert.equal(authenticateKey(regen.apiKey)!.key_class, 'runtime')
+    assert.equal(authenticateKey(admin.apiKey)!.key_class, 'tenant_admin')
+    // Rotation never mints a tenant_admin key.
+    const admins = getDB().prepare(`SELECT COUNT(*) c FROM api_keys WHERE tenant_id = ? AND key_class = 'tenant_admin'`).get(t.id) as any
+    assert.equal(admins.c, 1)
+  })
+
+  it('password reset revokes every key class, tenant_admin included', async () => {
+    const t = await tenantWithPassword()
+    const admin = issueTenantAdminKey(t.id)
+    const token = createPasswordResetToken(t.id)
+    const consumed = consumePasswordResetToken(token)
+    assert.equal(consumed.ok, true)
+    // The same call POST /auth/email/reset makes after setting the hash.
+    const revoked = revokeAllApiKeysForTenant(consumed.tenantId!)
+    assert.equal(revoked, 2)
+    assert.equal(authenticateKey(admin.apiKey), null)
+    assert.equal(authenticateKey(t.runtimeKey), null)
   })
 })

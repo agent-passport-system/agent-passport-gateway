@@ -61,6 +61,7 @@ import { initDB, getDB, PLAN_LIMITS, resolveTenantByEmail, addTenantAlias } from
 import { lookupByAddress, rebuildFromDb as rebuildWalletReverseIndex } from './gateway/wallet-reverse-index.js'
 import { buildAgentTrustProfile, publicizeProfile, type TrustProfile } from './gateway/trust-profile.js'
 import { authMiddleware, requireAdmin, createTenant } from './auth/api-keys.js'
+import { tenantAdminRouter, rotateRuntimeKeys } from './auth/tenant-admin.js'
 import { gatewayRouter } from './gateway/enforce.js'
 import { initLineageTables } from './gateway/lineage.js'
 import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/identity.js'
@@ -96,7 +97,7 @@ import {
   validatePassword, isValidEmail, normalizeEmail,
   hashPassword, verifyPassword, burnTime,
   findTenantByEmail, setTenantPassword, markEmailVerified,
-  issueApiKey, revokeAllApiKeysForTenant, parseLoginKeyClass,
+  issueApiKey, revokeAllApiKeysForTenant,
   createPasswordResetToken, consumePasswordResetToken,
   createEmailVerificationToken, consumeEmailVerificationToken,
 } from './auth/email-password.js'
@@ -644,11 +645,9 @@ app.post('/auth/email/signup', async (req, res) => {
   })
 })
 
-// POST /auth/email/login — verify password, issue new API key.
-// Optional body key_class: 'runtime' (default) or 'tenant_admin'. A
-// tenant_admin key manages the tenant's approver registry
-// (/api/v1/approvers). This route is the only place one is minted, and it
-// needs the password, so no API key (runtime or admin) can mint one.
+// POST /auth/email/login — verify password, issue new runtime API key.
+// Never a tenant_admin key: that has its own explicit issuance action,
+// POST /auth/tenant-admin/issue (src/auth/tenant-admin.ts).
 app.post('/auth/email/login', async (req, res) => {
   try {
     await emailAuthLoginLimiter.consume(req.ip || 'unknown')
@@ -657,10 +656,6 @@ app.post('/auth/email/login', async (req, res) => {
   }
 
   const { email: rawEmail, password } = req.body || {}
-  const keyClass = parseLoginKeyClass((req.body || {}).key_class)
-  if (!keyClass) {
-    return res.status(400).json({ error: "key_class must be 'runtime' or 'tenant_admin'", code: 'invalid_key_class' })
-  }
   if (!rawEmail || typeof rawEmail !== 'string' || !isValidEmail(rawEmail)) {
     // Don't leak whether the email is valid-format; still burn time.
     await burnTime()
@@ -692,19 +687,21 @@ app.post('/auth/email/login', async (req, res) => {
   }
 
   // Issue a fresh API key for this sign-in. Mirrors github-oauth pattern.
-  const apiKey = keyClass === 'tenant_admin'
-    ? issueApiKey(tenant.id, `tenant-admin-${Date.now()}`, 'tenant_admin')
-    : issueApiKey(tenant.id, `email-login-${Date.now()}`)
+  const apiKey = issueApiKey(tenant.id, `email-login-${Date.now()}`)
 
   return res.status(200).json({
     message: 'Signed in. Save your API key — it will not be shown again.',
     tenant_id: tenant.id,
     plan: tenant.plan,
     api_key: apiKey,
-    key_class: keyClass,
+    key_class: 'runtime',
     email_verified: tenant.email_verified === 1,
   })
 })
+
+// POST /auth/tenant-admin/issue — explicit tenant_admin key issuance
+// (account password required, 15-minute expiry). See src/auth/tenant-admin.ts.
+app.use(tenantAdminRouter)
 
 // POST /auth/email/forgot — send password reset link (always 200)
 app.post('/auth/email/forgot', async (req, res) => {
@@ -1785,7 +1782,7 @@ app.get('/api/v1/account', authMiddleware, (req: any, res) => {
 
   // API keys (prefix only, no hashes)
   const keys = db.prepare(
-    `SELECT id, key_prefix, name, key_class, created_at, last_used_at, revoked_at
+    `SELECT id, key_prefix, name, key_class, created_at, last_used_at, revoked_at, expires_at
      FROM api_keys WHERE tenant_id = ?`
   ).all(tenant.id) as any[]
 
@@ -1817,30 +1814,18 @@ app.get('/api/v1/account', authMiddleware, (req: any, res) => {
       key_class: k.key_class === 'tenant_admin' ? 'tenant_admin' : 'runtime',
       created_at: k.created_at,
       last_used_at: k.last_used_at,
-      active: !k.revoked_at,
+      expires_at: k.expires_at ?? null,
+      active: !k.revoked_at && !(k.expires_at && k.expires_at <= new Date().toISOString()),
     })),
   })
 })
 
-// Rotate API key — revokes current, issues new.
-// Revokes every key of the tenant, tenant_admin keys included, and issues a
-// runtime key (column default). It never issues a tenant_admin key; that
-// needs the password login (POST /auth/email/login, key_class=tenant_admin).
+// Rotate API key — revokes the tenant's runtime keys, issues a new runtime
+// key. tenant_admin keys are not revoked, minted or listed here (they
+// expire on their own; password reset revokes them).
 app.post('/api/v1/account/rotate-key', authMiddleware, (req: any, res) => {
   const tenant = req.tenant
-  const db = getDB()
-
-  // Revoke all existing keys
-  db.prepare(`UPDATE api_keys SET revoked_at = datetime('now') WHERE tenant_id = ? AND revoked_at IS NULL`)
-    .run(tenant.id)
-
-  // Create new key
-  const rawKey = `aps_live_${randomBytes(32).toString('hex')}`
-  const keyHash = createHash('sha256').update(rawKey).digest('hex')
-  const keyPrefix = rawKey.slice(0, 12)
-
-  db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
-    .run(randomUUID(), tenant.id, keyHash, keyPrefix, 'rotated')
+  const { apiKey: rawKey, keyPrefix } = rotateRuntimeKeys(tenant.id, 'rotated')
   try { getEventBus().emit(tenant.id, { type: 'key_rotated', data: { key_prefix: keyPrefix } }) } catch {}
 
   res.json({
@@ -1850,22 +1835,10 @@ app.post('/api/v1/account/rotate-key', authMiddleware, (req: any, res) => {
 })
 
 // POST /api/v1/account/regenerate-key — generate new key, invalidate old, email notification
-// Same key-class rule as rotate-key: revokes all, issues a runtime key.
+// Same key-class rule as rotate-key: runtime keys only.
 app.post('/api/v1/account/regenerate-key', authMiddleware, (req: any, res) => {
   const tenant = req.tenant
-  const db = getDB()
-
-  // Revoke all existing keys
-  db.prepare(`UPDATE api_keys SET revoked_at = datetime('now') WHERE tenant_id = ? AND revoked_at IS NULL`)
-    .run(tenant.id)
-
-  // Generate new key
-  const rawKey = `aps_live_${randomBytes(32).toString('hex')}`
-  const keyHash = createHash('sha256').update(rawKey).digest('hex')
-  const keyPrefix = rawKey.slice(0, 12)
-
-  db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
-    .run(randomUUID(), tenant.id, keyHash, keyPrefix, 'regenerated')
+  const { apiKey: rawKey, keyPrefix } = rotateRuntimeKeys(tenant.id, 'regenerated')
   try { getEventBus().emit(tenant.id, { type: 'key_rotated', data: { key_prefix: keyPrefix } }) } catch {}
 
   // Email notification

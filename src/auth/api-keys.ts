@@ -22,9 +22,12 @@ export type TenantRole = 'admin' | 'user'
 /** Class of the API key that authenticated the request. Per-key, unlike
  *  `role` (per-tenant, platform operator).
  *  `runtime`      = agent and integration keys (default, every legacy key).
- *  `tenant_admin` = the tenant's administration credential. Minted only on
- *                   the password login path, never from another API key.
- *                   Required to manage the tenant's approver registry. */
+ *  `tenant_admin` = the tenant's administration credential. Minted only by
+ *                   the explicit issuance action (POST /auth/tenant-admin/issue,
+ *                   account password required), never from another API key.
+ *                   Short-lived, expiry enforced here in authenticateKey.
+ *                   Required to manage the tenant's approver registry.
+ *                   See src/auth/tenant-admin.ts. */
 export type KeyClass = 'runtime' | 'tenant_admin'
 
 export interface Tenant {
@@ -72,6 +75,7 @@ export function createTenant(opts: {
 
 /**
  * Authenticate a request by API key. Returns tenant or null.
+ * A key past its expires_at (tenant_admin keys) is refused like a revoked one.
  */
 export function authenticateKey(rawKey: string): Tenant | null {
   const db = getDB()
@@ -80,7 +84,8 @@ export function authenticateKey(rawKey: string): Tenant | null {
     SELECT t.*, k.id AS key_id, k.key_class AS key_class FROM tenants t
     JOIN api_keys k ON k.tenant_id = t.id
     WHERE k.key_hash = ? AND k.revoked_at IS NULL AND t.status = 'active'
-  `).get(keyHash) as (Tenant & { role?: string; key_class?: string }) | undefined
+      AND (k.expires_at IS NULL OR k.expires_at > ?)
+  `).get(keyHash, new Date().toISOString()) as (Tenant & { role?: string; key_class?: string }) | undefined
 
   if (!row) return null
   // Update last_used_at
