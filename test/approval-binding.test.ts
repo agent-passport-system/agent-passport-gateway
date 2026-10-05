@@ -299,6 +299,7 @@ describe('sign - server-bound body fields are refused', () => {
     ['key_class', 'approver'],
     ['office_id', 'treasury'],
     ['decision_latency_ms', 600000],
+    ['batch_size', 1],
   ]
   for (const [field, value] of cases) {
     it(`${field} in the body is 400 server_bound_field and stores nothing`, async () => {
@@ -316,7 +317,7 @@ describe('sign - server-bound body fields are refused', () => {
     })
   }
 
-  it('all five together are named in one 400', async () => {
+  it('all six together are named in one 400', async () => {
     const a = approver(['payments:*'])
     const id = await open(); backdate(id)
     const r = await call('POST', `/approvals/${id}/sign`, {
@@ -408,21 +409,18 @@ describe('sign - elapsed time is not an authorization input', () => {
     assert.equal(getApprovalHistory(a.id).length, 0)
   })
 
-  it('twenty fast accepted signs are not refused; the rubber-stamp pattern is reported only', async () => {
+  it('twenty-one fast accepted signs are neither refused nor flagged', async () => {
     const a = approver(['payments:*'])
-    const flags: Array<string | null> = []
     for (let i = 0; i < 21; i++) {
       const id = await open()
       const r = await call('POST', `/approvals/${id}/sign`, { approver_id: a.id, reason: 'reviewed it', signature: sigFor(id, a.kp) })
       assert.equal(r.status, 201, `sign ${i}: ${JSON.stringify(r.json)}`)
-      flags.push(r.json.fatigue_flag)
+      // No rubber-stamp check runs on /sign and no fatigue flag is returned.
+      assert.equal('fatigue_flag' in r.json, false, `sign ${i}`)
+      assert.deepEqual(Object.keys(r.json).sort(), ['commitment_digest', 'request_id', 'signature_id'])
     }
+    // History is still recorded as telemetry, one entry per accepted sign.
     assert.equal(getApprovalHistory(a.id).length, 21)
-    // Reported once, at the 20th accepted signature (the helper's window),
-    // and never turned into a refusal. The helper does not re-raise an
-    // unreviewed flag.
-    assert.equal(flags[19], 'rubber_stamping')
-    assert.equal(flags.filter(Boolean).length, 1)
   })
 })
 

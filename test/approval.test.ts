@@ -204,7 +204,7 @@ describe('no bulk approvals for high-risk', () => {
     assert.equal(r.allowed, true)
   })
 
-  it('route: body batch_size is not read; one /sign covers one request, so the batch is 1', async () => {
+  it('route: body batch_size is 400 server_bound_field; one /sign covers one request', async () => {
     const created = await post('/approvals', {
       action_class: 'payments:refund', subject: 'inv-1',
       agent_id: AGENT, requested_by: 'requester',
@@ -217,9 +217,25 @@ describe('no bulk approvals for high-risk', () => {
       approver_id: 'outsider-bulk', reason: 'reviewed the refund batch',
       signature: commitSig(created.json.id, kp), batch_size: 12,
     })
-    // The body claim neither triggers nor suppresses the bulk rule: the
-    // server derives batch size 1 for a single-request signature.
-    assert.equal(signed.status, 201)
+    // The batch is not the caller's to state: one /sign call is one
+    // signature over one request commitment. Refused by name, nothing stored.
+    assert.equal(signed.status, 400)
+    assert.equal(signed.json.code, 'server_bound_field')
+    assert.deepEqual(signed.json.fields, ['batch_size'])
+    for (const n of [1, '1', 0, null]) {
+      const r = await post(`/approvals/${created.json.id}/sign`, {
+        approver_id: 'outsider-bulk', reason: 'reviewed the refund batch',
+        signature: commitSig(created.json.id, kp), batch_size: n,
+      })
+      assert.equal(r.status, 400, `batch_size ${JSON.stringify(n)}`)
+      assert.equal(r.json.code, 'server_bound_field')
+    }
+    // Without it, the same signature is accepted.
+    const ok = await post(`/approvals/${created.json.id}/sign`, {
+      approver_id: 'outsider-bulk', reason: 'reviewed the refund batch',
+      signature: commitSig(created.json.id, kp),
+    })
+    assert.equal(ok.status, 201)
   })
 })
 
@@ -258,7 +274,7 @@ describe('approver-outside-owner for high-risk', () => {
     backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
       approver_id: OWNER_ENTITY, reason: 'I own this agent',
-      signature: commitSig(created.json.id, kp), batch_size: 1,
+      signature: commitSig(created.json.id, kp),
     })
     assert.equal(signed.status, 403)
     assert.equal(signed.json.code, 'self_approval_high_risk')
@@ -273,7 +289,7 @@ describe('approver-outside-owner for high-risk', () => {
     backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
       approver_id: 'outsider-1', reason: 'verified payee and amount',
-      signature: commitSig(created.json.id, kp), batch_size: 1,
+      signature: commitSig(created.json.id, kp),
     })
     assert.equal(signed.status, 201)
     assert.ok(signed.json.signature_id)
@@ -287,7 +303,7 @@ describe('approver-outside-owner for high-risk', () => {
     const kp = registerTestApprover('outsider-2', ['payments:*'])
     backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
-      approver_id: 'outsider-2', signature: commitSig(created.json.id, kp), batch_size: 1,
+      approver_id: 'outsider-2', signature: commitSig(created.json.id, kp),
     })
     assert.equal(signed.status, 400)
   })
@@ -344,7 +360,7 @@ describe('approval receipt issued', () => {
     backdate(created.json.id)
     const signed = await post(`/approvals/${created.json.id}/sign`, {
       approver_id: 'outsider-r', reason: 'amount and payee verified against the invoice',
-      batch_size: 1, signature: commitSig(created.json.id, kp),
+      signature: commitSig(created.json.id, kp),
     })
     assert.equal(signed.status, 201)
 
