@@ -19,6 +19,17 @@ import type { Plan } from '../db/schema.js'
  *  authority. See CODE-AUDIT-2026-04-11.md §2.9 for context. */
 export type TenantRole = 'admin' | 'user'
 
+/** Class of the API key that authenticated the request. Per-key, unlike
+ *  `role` (per-tenant, platform operator).
+ *  `runtime`      = agent and integration keys (default, every legacy key).
+ *  `tenant_admin` = the tenant's administration credential. Minted only by
+ *                   the explicit issuance action (POST /auth/tenant-admin/issue,
+ *                   account password required), never from another API key.
+ *                   Short-lived, expiry enforced here in authenticateKey.
+ *                   Required to manage the tenant's approver registry.
+ *                   See src/auth/tenant-admin.ts. */
+export type KeyClass = 'runtime' | 'tenant_admin'
+
 export interface Tenant {
   id: string
   name: string
@@ -27,6 +38,9 @@ export interface Tenant {
   stripe_customer_id: string | null
   status: string
   role: TenantRole
+  /** Set by authenticateKey: the class and id of the presenting key. */
+  key_class?: KeyClass
+  key_id?: string
 }
 
 function hashKey(key: string): string {
@@ -61,28 +75,70 @@ export function createTenant(opts: {
 
 /**
  * Authenticate a request by API key. Returns tenant or null.
+ * A key past its expires_at is refused like a revoked one. A runtime key
+ * with NULL expires_at (every legacy key) does not expire. A tenant_admin
+ * key must carry a parseable expiry in the future: NULL or malformed is
+ * refused, so an admin row written without one (562c128 on this branch
+ * minted such rows) never authenticates.
  */
 export function authenticateKey(rawKey: string): Tenant | null {
   const db = getDB()
   const keyHash = hashKey(rawKey)
+  const nowMs = Date.now()
   const row = db.prepare(`
-    SELECT t.* FROM tenants t
+    SELECT t.*, k.id AS key_id, k.key_class AS key_class, k.expires_at AS key_expires_at
+    FROM tenants t
     JOIN api_keys k ON k.tenant_id = t.id
     WHERE k.key_hash = ? AND k.revoked_at IS NULL AND t.status = 'active'
-  `).get(keyHash) as (Tenant & { role?: string }) | undefined
+      AND (k.expires_at IS NULL OR k.expires_at > ?)
+  `).get(keyHash, new Date(nowMs).toISOString()) as
+    (Tenant & { role?: string; key_class?: string; key_expires_at?: string | null }) | undefined
 
   if (!row) return null
+  if (row.key_class === 'tenant_admin') {
+    const exp = typeof row.key_expires_at === 'string' ? Date.parse(row.key_expires_at) : NaN
+    if (!Number.isFinite(exp) || exp <= nowMs) return null
+  }
+  delete row.key_expires_at
   // Update last_used_at
   db.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?`).run(keyHash)
   // Normalize role: the column is added by an idempotent ALTER TABLE in
   // schema.ts, but defensively default to 'user' if the migration has not
   // run on a stale DB connection.
   const role: TenantRole = row.role === 'admin' ? 'admin' : 'user'
-  return { ...row, role }
+  // Anything but an explicit tenant_admin is a runtime key.
+  const key_class: KeyClass = row.key_class === 'tenant_admin' ? 'tenant_admin' : 'runtime'
+  return { ...row, role, key_class }
 }
 
 /**
- * Express middleware: authenticate and attach tenant to req
+ * The only routes a tenant_admin key authenticates on: approver register,
+ * list and revoke, and the read-only account summary. An allowlist, so a
+ * route added later is closed to admin keys until it is listed here.
+ * Everything else, including approval open/sign/decide/receipt and runtime
+ * rotate-key/regenerate-key, refuses an admin key. The admin key therefore
+ * cannot mint, rotate or renew a runtime key.
+ *
+ * Matched against the full request path (req.originalUrl without the
+ * query), so the answer is the same at every mount point authMiddleware
+ * runs under. Case-insensitive with an optional trailing slash, the way
+ * Express routes by default. HEAD is not listed.
+ */
+export const TENANT_ADMIN_ROUTES: ReadonlyArray<{ method: string; path: RegExp }> = [
+  { method: 'GET', path: /^\/api\/v1\/account\/?$/i },
+  { method: 'GET', path: /^\/api\/v1\/approvers\/?$/i },
+  { method: 'POST', path: /^\/api\/v1\/approvers\/?$/i },
+  { method: 'POST', path: /^\/api\/v1\/approvers\/[^/]+\/revoke\/?$/i },
+]
+
+export function tenantAdminRouteAllowed(method: string, originalUrl: string): boolean {
+  const path = String(originalUrl || '').split('?')[0]
+  return TENANT_ADMIN_ROUTES.some(r => r.method === method && r.path.test(path))
+}
+
+/**
+ * Express middleware: authenticate and attach tenant to req.
+ * A tenant_admin key outside TENANT_ADMIN_ROUTES gets 403 tenant_admin_scope.
  */
 export function authMiddleware(req: any, res: any, next: any) {
   const authHeader = req.headers.authorization
@@ -93,6 +149,12 @@ export function authMiddleware(req: any, res: any, next: any) {
   const tenant = authenticateKey(key)
   if (!tenant) {
     return res.status(401).json({ error: 'Invalid or revoked API key' })
+  }
+  if (tenant.key_class === 'tenant_admin' && !tenantAdminRouteAllowed(req.method, req.originalUrl ?? req.url)) {
+    return res.status(403).json({
+      error: 'A tenant_admin key is limited to approver management and account read. Use a runtime key for this endpoint.',
+      code: 'tenant_admin_scope',
+    })
   }
   req.tenant = tenant
   next()
@@ -125,6 +187,30 @@ export function requireAdmin(req: any, res: any, next: any) {
   }
   if (tenant.role !== 'admin') {
     return res.status(403).json({ error: 'Admin role required for this endpoint' })
+  }
+  next()
+}
+
+/**
+ * Express middleware: require a tenant_admin key of the authenticated
+ * tenant. Must be chained AFTER authMiddleware.
+ *
+ * This is the tenant's own administration credential, not the platform
+ * operator: requireAdmin (tenants.role) is a different check and does not
+ * satisfy this one. A runtime key gets 403 tenant_admin_required.
+ * Tenant scoping is the caller's job: routes behind this middleware read
+ * and write only rows of req.tenant.id.
+ */
+export function requireTenantAdmin(req: any, res: any, next: any) {
+  const tenant: Tenant | undefined = req.tenant
+  if (!tenant) {
+    return res.status(401).json({ error: 'Authentication required' })
+  }
+  if (tenant.key_class !== 'tenant_admin') {
+    return res.status(403).json({
+      error: 'A tenant_admin key is required for this endpoint. Runtime keys cannot manage approvers.',
+      code: 'tenant_admin_required',
+    })
   }
   next()
 }

@@ -8,12 +8,15 @@
  *     Returns one API key, just like the GitHub OAuth path.
  *   - login verifies email+password, issues a *new* API key named
  *     "email-login-<ts>", mirroring how /auth/github/callback issues a
- *     fresh key on every sign-in.
+ *     fresh key on every sign-in. Always a runtime key. The tenant
+ *     administration key has its own explicit issuance action
+ *     (src/auth/tenant-admin.ts).
  *   - forgot generates a single-use reset token (SHA-256 stored, raw in
  *     email link). 1h expiry.
  *   - reset verifies the token, updates the password hash, marks the
  *     token used, and as a defence-in-depth measure revokes ALL existing
- *     api_keys for the tenant (forces re-issue, like Stripe / GitHub).
+ *     api_keys for the tenant, runtime and tenant_admin alike (forces
+ *     re-issue, like Stripe / GitHub).
  *   - verify-email marks email_verified=1 when the verification link is
  *     opened. Soft signal today; will gate sensitive ops later.
  *
@@ -178,23 +181,26 @@ function hashKey(key: string): string {
 }
 
 /**
- * Issue a new API key for an existing tenant. Mirrors the github-oauth
- * "additional key on each sign-in" pattern. Does not revoke other keys.
+ * Issue a new runtime API key for an existing tenant. Mirrors the
+ * github-oauth "additional key on each sign-in" pattern. Does not revoke
+ * other keys. Never mints a tenant_admin key (see tenant-admin.ts).
  */
 export function issueApiKey(tenantId: string, name: string): string {
   const db = getDB()
   const rawKey = `aps_live_${randomBytes(32).toString('hex')}`
   const keyHash = hashKey(rawKey)
   const keyPrefix = rawKey.slice(0, 12)
-  db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?, ?)`)
+  db.prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name, key_class) VALUES (?, ?, ?, ?, ?, 'runtime')`)
     .run(randomUUID(), tenantId, keyHash, keyPrefix, name)
   return rawKey
 }
 
 /**
- * Revoke all active API keys for a tenant. Used on password reset as
- * defence-in-depth: if an attacker captured a key, the reset locks them
- * out. The user re-issues a fresh key via login.
+ * Revoke all active API keys for a tenant, every key class (runtime and
+ * tenant_admin). Used on password reset as defence-in-depth: if an
+ * attacker captured a key, the reset locks them out. The user re-issues a
+ * fresh key via login. This is the one recovery operation that revokes
+ * tenant_admin keys; runtime rotation does not (tenant-admin.ts).
  */
 export function revokeAllApiKeysForTenant(tenantId: string): number {
   const db = getDB()

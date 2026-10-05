@@ -142,11 +142,21 @@ export interface ScopeCheckInput {
   approverAuthority: readonly string[]
   /** Approver identity (tenant-scoped principal id). */
   approverId: string
+  /** Registry owner relationship of the approver (the principal it acts
+   *  for). Compared against the owner set alongside approverId. */
+  approverPrincipalId?: string
+  /** Further registered identities that count as the owner side for the
+   *  independence check (the agent id, the API key id that opened the
+   *  request). Pass stored, server-recorded ids only, never caller-supplied
+   *  names. Never widens what is allowed. */
+  ownerAliases?: readonly string[]
   /** The agent whose action is being approved, and the agent OWNER
    *  (principal that owns the agent). For high-risk, approverId must
    *  differ from the owner. */
   agentOwnerId: string
-  /** How many requests this single approval action would cover. >1 = bulk. */
+  /** How many requests this single approval action would cover. >1 = bulk.
+   *  Derived by the caller of this function, never taken from a request
+   *  body. /sign always passes 1 (one signature, one request commitment). */
   batchSize: number
 }
 
@@ -176,8 +186,13 @@ export function checkScopedAuthority(input: ScopeCheckInput): ScopeCheckResult {
 
   const highRisk = isHighRiskTier(input.tier)
 
-  // Rule 2: high-risk requires approver OUTSIDE the agent owner.
-  if (highRisk && input.approverId === input.agentOwnerId) {
+  // Rule 2: high-risk requires approver OUTSIDE the agent owner. Both the
+  // approver id and its registered principal must be outside the owner set.
+  // This compares registered identities; it does not establish that a
+  // different human holds the approver's key.
+  const ownerSide = new Set([input.agentOwnerId, ...(input.ownerAliases ?? [])].filter(Boolean))
+  const approverSide = [input.approverId, input.approverPrincipalId].filter(Boolean) as string[]
+  if (highRisk && approverSide.some(x => ownerSide.has(x))) {
     return {
       allowed: false,
       code: 'self_approval_high_risk',

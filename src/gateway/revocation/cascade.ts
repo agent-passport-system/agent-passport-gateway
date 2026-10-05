@@ -132,22 +132,22 @@ export function walkDescendants(tenantId: string, rootAgentId: string): Delegati
 
 function countPendingApprovals(tenantId: string, targetId: string): number {
   const db = getDB()
-  // Approvals tables vary across deployments; guard with a table-existence check
-  // so preview never throws on a schema that lacks them.
+  // The approval tables self-create on first use of the approval router; guard
+  // with a table-existence check so preview never throws before that.
   const tbl = db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='approval_requests'`,
   ).get() as { name?: string } | undefined
   if (!tbl?.name) return 0
-  try {
-    const row = db.prepare(
-      `SELECT COUNT(*) AS c FROM approval_requests
-        WHERE tenant_id = ? AND status = 'pending'
-          AND (agent_id = ? OR target_id = ?)`,
-    ).get(tenantId, targetId, targetId) as { c: number }
-    return row.c
-  } catch {
-    return 0
-  }
+  // approval_requests links to the agent through agent_id (store.ts); there is
+  // no target column. No catch here: a query error used to be swallowed into 0,
+  // which hid a reference to a column that never existed.
+  // Expiry is swept lazily by the approval router, so a past-due row can still
+  // read 'pending'; it is not counted.
+  const row = db.prepare(
+    `SELECT COUNT(*) AS c FROM approval_requests
+      WHERE tenant_id = ? AND status = 'pending' AND agent_id = ? AND expires_at > ?`,
+  ).get(tenantId, targetId, new Date().toISOString()) as { c: number }
+  return row.c
 }
 
 /**
