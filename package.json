@@ -1,6 +1,6 @@
 {
   "name": "agent-passport-gateway",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "AEOESS Hosted Enforcement Gateway",
   "main": "dist/server.js",
   "scripts": {
