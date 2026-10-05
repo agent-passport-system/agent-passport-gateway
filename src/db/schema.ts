@@ -775,6 +775,17 @@ function createTables() {
     )`)
   } catch {}
 
+  // API key class. Separates a tenant administration credential from the
+  // runtime keys agents and integrations use.
+  // key_class = 'runtime'      → every key minted before this column existed,
+  //                              and every key minted by signup, GitHub
+  //                              OAuth, rotate/regenerate and default login
+  // key_class = 'tenant_admin' → minted only by POST /auth/email/login with
+  //                              key_class=tenant_admin (password required),
+  //                              so a runtime key can never mint one.
+  // Not the platform-operator role: that is tenants.role (below).
+  try { db.exec(`ALTER TABLE api_keys ADD COLUMN key_class TEXT NOT NULL DEFAULT 'runtime'`) } catch {}
+
   // Security triage 2026-04-11 fix 1: tenant role column.
   // Decouples admin authorization from the `plan` billing concept.
   // role = 'admin'  → platform operator (can access /api/v1/admin/* routes)
