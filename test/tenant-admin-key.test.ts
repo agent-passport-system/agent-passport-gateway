@@ -7,6 +7,10 @@
 //   - a tenant_admin key comes only from POST /auth/tenant-admin/issue with
 //     the account password, expires after TENANT_ADMIN_TTL_MS, and an
 //     expired one is refused by authenticateKey
+//   - an admin row with NULL or malformed expiry is refused; a runtime key
+//     with NULL expiry (every legacy key) keeps working
+//   - an admin key reads GET /api/v1/account but gets 403
+//     tenant_admin_scope on an ordinary authenticated route
 //   - no API key can mint or renew one: the issuance route reads only
 //     email + password
 //   - runtime rotation (rotateRuntimeKeys, used by rotate-key and
@@ -162,9 +166,12 @@ describe('tenant_admin issuance (POST /auth/tenant-admin/issue)', () => {
     assert.equal(r.json.ttl_seconds, 900)
     const exp = Date.parse(r.json.expires_at)
     assert.ok(exp >= before + TENANT_ADMIN_TTL_MS && exp <= after + TENANT_ADMIN_TTL_MS)
+    const acct = await call('GET', '/api/v1/account', undefined, r.json.api_key)
+    assert.equal(acct.status, 200, 'account read is on the admin allowlist')
+    assert.equal(acct.json.tenant_id, t.id)
     const who = await call('GET', '/api/v1/whoami', undefined, r.json.api_key)
-    assert.equal(who.status, 200)
-    assert.deepEqual(who.json, { id: t.id, key_class: 'tenant_admin' })
+    assert.equal(who.status, 403, 'an ordinary authenticated route is not')
+    assert.equal(who.json.code, 'tenant_admin_scope')
     const row = getDB().prepare(`SELECT key_class, expires_at FROM api_keys WHERE key_hash = ?`)
       .get(createHash('sha256').update(r.json.api_key).digest('hex')) as any
     assert.equal(row.key_class, 'tenant_admin')
@@ -208,6 +215,41 @@ describe('tenant_admin issuance (POST /auth/tenant-admin/issue)', () => {
     assert.equal(authenticateKey(live.apiKey)!.key_class, 'tenant_admin')
     getDB().prepare(`UPDATE api_keys SET expires_at = ? WHERE id = ?`).run(new Date(Date.now() - 1).toISOString(), live.keyId)
     assert.equal(authenticateKey(live.apiKey), null)
+  })
+})
+
+describe('tenant_admin keys must carry an expiry', () => {
+  it('an admin row with expires_at NULL is refused at authentication', async () => {
+    const t = await tenantWithPassword()
+    // The state 562c128 left behind: an admin key with no expiry.
+    const raw = `aps_live_${randomBytes(32).toString('hex')}`
+    getDB().prepare(`INSERT INTO api_keys (id, tenant_id, key_hash, key_prefix, name, key_class, expires_at)
+      VALUES (?, ?, ?, ?, 'legacy-admin', 'tenant_admin', NULL)`)
+      .run(randomUUID(), t.id, createHash('sha256').update(raw).digest('hex'), raw.slice(0, 12))
+    assert.equal(authenticateKey(raw), null)
+    const r = await call('GET', '/api/v1/account', undefined, raw)
+    assert.equal(r.status, 401)
+    const lastUsed = getDB().prepare(`SELECT last_used_at FROM api_keys WHERE key_hash = ?`)
+      .get(createHash('sha256').update(raw).digest('hex')) as any
+    assert.equal(lastUsed.last_used_at, null, 'a refused key is not marked used')
+  })
+
+  it('an admin row with a malformed expiry is refused too', async () => {
+    const t = await tenantWithPassword()
+    const admin = issueTenantAdminKey(t.id)
+    // 'never' sorts after any ISO date, so a string compare alone would pass it.
+    getDB().prepare(`UPDATE api_keys SET expires_at = 'never' WHERE id = ?`).run(admin.keyId)
+    assert.equal(authenticateKey(admin.apiKey), null)
+  })
+
+  it('a runtime key with expires_at NULL keeps working (legacy keys)', async () => {
+    const t = await tenantWithPassword()
+    const row = getDB().prepare(`SELECT expires_at, key_class FROM api_keys WHERE key_hash = ?`)
+      .get(createHash('sha256').update(t.runtimeKey).digest('hex')) as any
+    assert.deepEqual(row, { expires_at: null, key_class: 'runtime' })
+    assert.equal(authenticateKey(t.runtimeKey)!.key_class, 'runtime')
+    assert.equal((await call('GET', '/api/v1/whoami', undefined, t.runtimeKey)).status, 200)
+    assert.equal(authenticateKey(LEGACY_KEY)!.key_class, 'runtime', 'the pre-migration key too')
   })
 })
 

@@ -14,6 +14,12 @@
  *   - expires TENANT_ADMIN_TTL_MS after issuance. authenticateKey refuses
  *     it after that. Nothing extends expires_at; a new one needs the
  *     password again.
+ *   - an admin row without a valid expiry is refused at authentication.
+ *   - authenticates only on approver register/list/revoke and GET
+ *     /api/v1/account (TENANT_ADMIN_ROUTES in api-keys.ts). Every other
+ *     route, approval open/sign/decide and runtime rotate/regenerate
+ *     included, answers 403 tenant_admin_scope, so an admin key cannot mint
+ *     a runtime key.
  *   - runtime rotate/regenerate (rotateRuntimeKeys) revoke and mint runtime
  *     keys only and leave tenant_admin keys alone.
  *   - password reset revokes every key of the tenant, tenant_admin included

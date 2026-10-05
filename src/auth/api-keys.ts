@@ -75,19 +75,31 @@ export function createTenant(opts: {
 
 /**
  * Authenticate a request by API key. Returns tenant or null.
- * A key past its expires_at (tenant_admin keys) is refused like a revoked one.
+ * A key past its expires_at is refused like a revoked one. A runtime key
+ * with NULL expires_at (every legacy key) does not expire. A tenant_admin
+ * key must carry a parseable expiry in the future: NULL or malformed is
+ * refused, so an admin row written without one (562c128 on this branch
+ * minted such rows) never authenticates.
  */
 export function authenticateKey(rawKey: string): Tenant | null {
   const db = getDB()
   const keyHash = hashKey(rawKey)
+  const nowMs = Date.now()
   const row = db.prepare(`
-    SELECT t.*, k.id AS key_id, k.key_class AS key_class FROM tenants t
+    SELECT t.*, k.id AS key_id, k.key_class AS key_class, k.expires_at AS key_expires_at
+    FROM tenants t
     JOIN api_keys k ON k.tenant_id = t.id
     WHERE k.key_hash = ? AND k.revoked_at IS NULL AND t.status = 'active'
       AND (k.expires_at IS NULL OR k.expires_at > ?)
-  `).get(keyHash, new Date().toISOString()) as (Tenant & { role?: string; key_class?: string }) | undefined
+  `).get(keyHash, new Date(nowMs).toISOString()) as
+    (Tenant & { role?: string; key_class?: string; key_expires_at?: string | null }) | undefined
 
   if (!row) return null
+  if (row.key_class === 'tenant_admin') {
+    const exp = typeof row.key_expires_at === 'string' ? Date.parse(row.key_expires_at) : NaN
+    if (!Number.isFinite(exp) || exp <= nowMs) return null
+  }
+  delete row.key_expires_at
   // Update last_used_at
   db.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?`).run(keyHash)
   // Normalize role: the column is added by an idempotent ALTER TABLE in
@@ -100,7 +112,33 @@ export function authenticateKey(rawKey: string): Tenant | null {
 }
 
 /**
- * Express middleware: authenticate and attach tenant to req
+ * The only routes a tenant_admin key authenticates on: approver register,
+ * list and revoke, and the read-only account summary. An allowlist, so a
+ * route added later is closed to admin keys until it is listed here.
+ * Everything else, including approval open/sign/decide/receipt and runtime
+ * rotate-key/regenerate-key, refuses an admin key. The admin key therefore
+ * cannot mint, rotate or renew a runtime key.
+ *
+ * Matched against the full request path (req.originalUrl without the
+ * query), so the answer is the same at every mount point authMiddleware
+ * runs under. Case-insensitive with an optional trailing slash, the way
+ * Express routes by default. HEAD is not listed.
+ */
+export const TENANT_ADMIN_ROUTES: ReadonlyArray<{ method: string; path: RegExp }> = [
+  { method: 'GET', path: /^\/api\/v1\/account\/?$/i },
+  { method: 'GET', path: /^\/api\/v1\/approvers\/?$/i },
+  { method: 'POST', path: /^\/api\/v1\/approvers\/?$/i },
+  { method: 'POST', path: /^\/api\/v1\/approvers\/[^/]+\/revoke\/?$/i },
+]
+
+export function tenantAdminRouteAllowed(method: string, originalUrl: string): boolean {
+  const path = String(originalUrl || '').split('?')[0]
+  return TENANT_ADMIN_ROUTES.some(r => r.method === method && r.path.test(path))
+}
+
+/**
+ * Express middleware: authenticate and attach tenant to req.
+ * A tenant_admin key outside TENANT_ADMIN_ROUTES gets 403 tenant_admin_scope.
  */
 export function authMiddleware(req: any, res: any, next: any) {
   const authHeader = req.headers.authorization
@@ -111,6 +149,12 @@ export function authMiddleware(req: any, res: any, next: any) {
   const tenant = authenticateKey(key)
   if (!tenant) {
     return res.status(401).json({ error: 'Invalid or revoked API key' })
+  }
+  if (tenant.key_class === 'tenant_admin' && !tenantAdminRouteAllowed(req.method, req.originalUrl ?? req.url)) {
+    return res.status(403).json({
+      error: 'A tenant_admin key is limited to approver management and account read. Use a runtime key for this endpoint.',
+      code: 'tenant_admin_scope',
+    })
   }
   req.tenant = tenant
   next()

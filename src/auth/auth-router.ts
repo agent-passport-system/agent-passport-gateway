@@ -257,7 +257,8 @@ export function createAuthRouter(opts: AuthRouterOptions = {}): Router {
   })
 
   // GET /api/v1/account — account summary. Lists API keys by prefix, class
-  // and expiry, never secrets.
+  // and expiry, never secrets. Read-only, and one of the routes a
+  // tenant_admin key may call (TENANT_ADMIN_ROUTES).
   router.get('/api/v1/account', authMiddleware, (req: any, res) => {
     const tenant = req.tenant
     const db = getDB()
@@ -324,14 +325,21 @@ export function createAuthRouter(opts: AuthRouterOptions = {}): Router {
         created_at: k.created_at,
         last_used_at: k.last_used_at,
         expires_at: k.expires_at ?? null,
-        active: !k.revoked_at && !(k.expires_at && k.expires_at <= new Date().toISOString()),
+        // Same rule as authenticateKey: an admin key without a valid
+        // future expiry is inactive.
+        active: !k.revoked_at && (k.key_class === 'tenant_admin'
+          ? Date.parse(k.expires_at ?? '') > Date.now()
+          : !(k.expires_at && k.expires_at <= new Date().toISOString())),
       })),
     })
   })
 
   // Rotate API key — revokes the tenant's runtime keys, issues a new runtime
   // key. tenant_admin keys are not revoked, minted or listed here (they
-  // expire on their own; password reset revokes them).
+  // expire on their own; password reset revokes them). A tenant_admin key
+  // cannot call this or regenerate-key: authMiddleware refuses it outside
+  // TENANT_ADMIN_ROUTES (api-keys.ts), so an admin key never mints a
+  // runtime key that would outlive it.
   router.post('/api/v1/account/rotate-key', authMiddleware, (req: any, res) => {
     const tenant = req.tenant
     const { apiKey: rawKey, keyPrefix } = rotateRuntimeKeys(tenant.id, 'rotated')
