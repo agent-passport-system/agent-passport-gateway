@@ -1340,6 +1340,21 @@ export class ProxyGateway {
     agent: RegisteredAgent,
     delegation: Delegation
   ): Promise<ToolCallResult> {
+    // The stored intent must still verify under the gateway key, over the same
+    // preimage createActionIntent signed. Refuse before any side effect, and
+    // leave the approval unconsumed.
+    const { signature: intentSignature, ...unsignedIntent } = approval.intent
+    let intentVerified = false
+    try { intentVerified = verify(canonicalize(unsignedIntent), intentSignature, this.config.gatewayPublicKey) } catch { intentVerified = false }
+    if (!intentVerified) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: 'Approved intent signature does not verify',
+        decision: structuredClone(approval.decision)
+      }
+    }
+
     // The stored params must still serialize to what the signed intent committed
     // to. Refuse before any side effect, and leave the approval unconsumed.
     if (JSON.stringify(approval.params) !== approval.intent.action.target) {
