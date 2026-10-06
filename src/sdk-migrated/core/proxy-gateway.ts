@@ -92,6 +92,10 @@ import type {
 export type ToolCallOutcome = 'succeeded' | 'tool_reported_failure' | 'unknown'
 
 export interface ToolCallResult extends BaseToolCallResult {
+  /** `executed` means the gateway called the executor. `outcome` says what was
+   *  observed after that call. 'unknown' claims neither that an effect happened
+   *  nor that none did. */
+  executed: boolean
   outcome?: ToolCallOutcome
 }
 
