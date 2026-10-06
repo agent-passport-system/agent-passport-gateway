@@ -113,6 +113,7 @@ export class ProxyGateway {
   private validator: PolicyValidator
   private agents: Map<string, RegisteredAgent> = new Map()
   private approvals: Map<string, GatewayApproval> = new Map()
+  private approvalRequests: WeakMap<GatewayApproval, ToolCallRequest> = new WeakMap() // frozen copy of the approved request, for onToolCall
   private usedRequestIds: Map<string, number> = new Map() // requestId → timestamp (NW-001: TTL-based pruning)
   private requestsSinceCleanup = 0 // V5-MED-4: auto-cleanup counter
   private agentLocks: Map<string, Promise<void>> = new Map() // Per-agent sequential execution (concurrency fix)
@@ -932,6 +933,7 @@ export class ProxyGateway {
     } catch (err: unknown) {
       this.stats.totalToolErrors++
       this.usedRequestIds.set(request.requestId, Date.now())
+      this.persistNonce(request.requestId)
       const result: ToolCallResult = { executed: true, outcome: 'unknown', requestId: request.requestId, toolError: err instanceof Error ? err.message : String(err), decision }
       this.config.onToolCall?.(request, result)
       return result
@@ -1273,6 +1275,7 @@ export class ProxyGateway {
     }
 
     this.approvals.set(approval.approvalId, approval)
+    this.approvalRequests.set(approval, deepFreeze(structuredClone({ ...request, params: paramsSnapshot })))
     this.stats.pendingApprovals = Array.from(this.approvals.values()).filter(a => !a.consumed).length
     // Hand back a copy; the stored approval is only reachable through approvalId.
     return { approved: true, approval: structuredClone(approval) }
@@ -1473,7 +1476,10 @@ export class ProxyGateway {
     catch (err: unknown) {
       // The approval stays consumed: the call was dispatched and its effect is unknown.
       this.stats.totalToolErrors++
-      return { executed: true, outcome: 'unknown', requestId: approval.requestId, toolError: err instanceof Error ? err.message : String(err), decision: structuredClone(approval.decision) }
+      this.persistNonce(approval.requestId)
+      const result: ToolCallResult = { executed: true, outcome: 'unknown', requestId: approval.requestId, toolError: err instanceof Error ? err.message : String(err), decision: structuredClone(approval.decision) }
+      this.reportApprovalToolCall(approval, result)
+      return result
     }
 
     if (toolResult.success) { this.stats.totalExecuted++ } else { this.stats.totalToolErrors++ }
@@ -1565,7 +1571,7 @@ export class ProxyGateway {
       })()
     }
 
-    return {
+    const result: ToolCallResult = {
       executed: true, requestId: approval.requestId,
       outcome: toolResult.success ? 'succeeded' : 'tool_reported_failure',
       result: toolResult.result, toolError: toolResult.success ? undefined : toolResult.error,
@@ -1575,6 +1581,27 @@ export class ProxyGateway {
       envelope,
       tierCheck
     }
+    this.reportApprovalToolCall(approval, result)
+    return result
+  }
+
+  /** Report a dispatched approval to onToolCall with the request it was approved from. */
+  private reportApprovalToolCall(approval: GatewayApproval, result: ToolCallResult): void {
+    const request = this.approvalRequests.get(approval)
+    if (request) this.config.onToolCall?.(request, result)
+  }
+
+  /** Persist a dispatched requestId when no receipt is written (effect unknown). */
+  private persistNonce(requestId: string): void {
+    if (!this.storage) return
+    const s = this.storage
+    ;(async () => {
+      try {
+        await s.transaction(async (tx) => {
+          await tx.checkAndStoreNonce(requestId, Math.floor((this.config.requestIdTTLMs || 3600000) / 1000))
+        })
+      } catch (_e) { /* storage write failure — in-memory state is still authoritative */ }
+    })()
   }
 
   clearExpired(): number {
