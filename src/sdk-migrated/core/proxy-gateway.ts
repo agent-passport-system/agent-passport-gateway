@@ -1402,6 +1402,25 @@ export class ProxyGateway {
       }
     }
 
+    // A genuine gateway decision is only admissible for the intent it evaluated,
+    // and only with a verdict approve() admits. createPolicyReceipt and
+    // createExecutionEnvelope would otherwise throw after dispatch.
+    const decisionMismatch =
+      approval.decision.intentId !== approval.intent.intentId ? 'Approved decision does not reference the approved intent'
+      : approval.decision.verdict !== 'permit' && approval.decision.verdict !== 'narrow' ? 'Approved decision verdict is not admissible'
+      : this.config.produceEnvelope && approval.decision.verdict === 'narrow' && approval.decision.constraints
+        && !(Array.isArray(approval.decision.constraints) && approval.decision.constraints.every(c => typeof c === 'string'))
+        ? 'Approved decision constraints cannot be recorded in the execution envelope'
+      : null
+    if (decisionMismatch) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: decisionMismatch,
+        decision: structuredClone(approval.decision)
+      }
+    }
+
     // Frame TTL auto-rotation (F-2 fix)
     if (this.config.enableCrossChainEnforcement && agent.executionFrame) {
       if (isFrameExpired(agent.executionFrame)) {
