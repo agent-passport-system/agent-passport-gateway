@@ -82,11 +82,13 @@ describe('ProxyGateway approval parameter binding', () => {
 
     try { (approval.params as any).amount = 4100 } catch { /* frozen is fine */ }
     try { (approval.params as any).meta.memo = 'changed' } catch { /* frozen is fine */ }
+    approval.params = { ...APPROVED, amount: 4100 }
 
     const result = await gateway.executeApproval(approval.approvalId)
     assert.equal(result.executed, true, result.denialReason)
     assert.equal(calls.length, 1)
     assert.deepEqual(calls[0].params, APPROVED)
+    assert.ok(Object.isFrozen(calls[0].params) && Object.isFrozen(calls[0].params.meta), 'executor receives the frozen snapshot')
     assert.equal(result.receipt!.action.target, JSON.stringify(APPROVED))
   })
 
