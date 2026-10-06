@@ -66,7 +66,7 @@ import type {
   ExecutionEnvelope,
   ScopedReputation, AuthorityTier, TierEscalation, EvidenceClass, TierCheckContext,
   AutonomyLevel,
-  ToolCallRequest, ToolCallResult, GatewayProof,
+  ToolCallRequest, ToolCallResult as BaseToolCallResult, GatewayProof,
   GatewayApproval, ToolExecutor, GatewayConfig,
   RegisteredAgent, GatewayStats, GatewayAgentRole,
   ConstraintFacet, ConstraintFailure, ConstraintVector,
@@ -86,6 +86,52 @@ import type {
   DataGateway,
 } from 'agent-passport-system'
 
+/** What is known about the effect of a dispatched call. Set only when the
+ *  gateway dispatched (executed: true). 'unknown' means the executor threw,
+ *  so it may or may not have acted before throwing. */
+export type ToolCallOutcome = 'succeeded' | 'tool_reported_failure' | 'unknown'
+
+export interface ToolCallResult extends BaseToolCallResult {
+  /** `executed` means the gateway called the executor. `outcome` says what was
+   *  observed after that call. 'unknown' claims neither that an effect happened
+   *  nor that none did. */
+  executed: boolean
+  outcome?: ToolCallOutcome
+  /** Post-dispatch steps that failed, as `step: message`. The executor already
+   *  ran, so a failure here never turns into a throw or changes `executed` or
+   *  `outcome`. A missing `receipt` means no receipt was produced. */
+  postDispatchErrors?: string[]
+}
+
+function errorMessage(err: unknown): string {
+  try { return err instanceof Error ? err.message : String(err) } catch { return 'unprintable error' }
+}
+
+/** Run one post-dispatch step. A throw is recorded in `errors` as `step: message`, never rethrown. */
+function postDispatchStep<T>(errors: string[], step: string, fn: () => T): T | undefined {
+  try { return fn() } catch (err: unknown) {
+    errors.push(`${step}: ${errorMessage(err)}`)
+    return undefined
+  }
+}
+
+/** Read the executor's result once. null when it is not a readable result object. */
+function readToolResult(value: unknown): { success: boolean; result?: unknown; error?: string } | null {
+  try {
+    if (value === null || typeof value !== 'object') return null
+    const { success, result, error } = value as { success?: unknown; result?: unknown; error?: string }
+    return { success: !!success, result, error }
+  } catch { return null }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const key of Object.keys(value)) deepFreeze((value as Record<string, unknown>)[key])
+    Object.freeze(value)
+  }
+  return value
+}
+
 
 // ══════════════════════════════════════
 // PROXY GATEWAY CLASS
@@ -96,6 +142,7 @@ export class ProxyGateway {
   private validator: PolicyValidator
   private agents: Map<string, RegisteredAgent> = new Map()
   private approvals: Map<string, GatewayApproval> = new Map()
+  private approvalRequests: WeakMap<GatewayApproval, ToolCallRequest> = new WeakMap() // frozen copy of the approved request, for onToolCall
   private usedRequestIds: Map<string, number> = new Map() // requestId → timestamp (NW-001: TTL-based pruning)
   private requestsSinceCleanup = 0 // V5-MED-4: auto-cleanup counter
   private agentLocks: Map<string, Promise<void>> = new Map() // Per-agent sequential execution (concurrency fix)
@@ -909,17 +956,18 @@ export class ProxyGateway {
 
     // Step 6: Execute the tool (GATEWAY executes, not agent)
     this.stats.totalPermitted++
-    let toolResult: { success: boolean; result?: unknown; error?: string }
+    let dispatched: unknown
     try {
-      toolResult = await this.executor(request.tool, request.params)
+      dispatched = await this.executor(request.tool, request.params)
     } catch (err: unknown) {
-      this.stats.totalToolErrors++
-      this.usedRequestIds.set(request.requestId, Date.now())
-      const result: ToolCallResult = { executed: true, requestId: request.requestId, toolError: err instanceof Error ? err.message : String(err), decision }
-      this.config.onToolCall?.(request, result)
-      return result
+      return this.finishUnknownToolCall(request, decision, errorMessage(err))
     }
+    const toolResult = readToolResult(dispatched)
+    if (!toolResult) return this.finishUnknownToolCall(request, decision, 'Executor did not return a result object')
 
+    // The executor has run. Nothing below may throw out of processToolCall: each
+    // step's failure is named in postDispatchErrors and the rest still runs.
+    const errors: string[] = []
     if (!toolResult.success) { this.stats.totalToolErrors++ } else { this.stats.totalExecuted++ }
 
     // Step 6.5: Taint tracking + SAO wrapping (Module 18)
@@ -927,35 +975,60 @@ export class ProxyGateway {
     // and wrap the result in an SAO for downstream taint propagation
     let sao: SignedAuthorityObject | undefined
     if (this.config.enableCrossChainEnforcement && agent.executionFrame && toolResult.success) {
-      const taintLabel = createTaintLabel(
+      const taintLabel = postDispatchStep(errors, 'createTaintLabel', () => createTaintLabel(
         delegation.delegatedBy,         // principal who authorized this
         delegation.delegationId,         // chain ID
         delegation.delegationId,         // delegation ID
         'same-context-only'
-      )
-      // Record this access on the agent's frame (accumulates taint)
-      agent.executionFrame = recordAccess(agent.executionFrame, taintLabel)
-      // Wrap result in SAO so downstream consumers see the taint
-      sao = createSAO(
-        toolResult.result,
-        taintLabel,
-        this.config.gatewayPrivateKey,
-        this.config.gatewayPublicKey
-      )
+      ))
+      if (taintLabel) {
+        // Record this access on the agent's frame (accumulates taint)
+        const frame = postDispatchStep(errors, 'recordAccess', () => recordAccess(agent.executionFrame!, taintLabel))
+        if (frame) agent.executionFrame = frame
+        // Wrap result in SAO so downstream consumers see the taint
+        sao = postDispatchStep(errors, 'createSAO', () => createSAO(
+          toolResult.result,
+          taintLabel,
+          this.config.gatewayPrivateKey,
+          this.config.gatewayPublicKey
+        ))
+      }
     }
 
     // Step 7: Generate receipt (GATEWAY signs, not agent)
     // For escalated actions, build receipt directly (base delegation's scope doesn't cover
     // the escalated action — that's the whole point of escalation). The gateway IS the
     // enforcement boundary and is authorized to sign receipts for escalated actions.
-    let receipt: ActionReceipt
-    if (viaEscalation && usedEscalationId) {
-      const receiptData: Omit<ActionReceipt, 'signature'> = {
-        receiptId: 'rcpt_' + uuidv4().slice(0, 12),
-        version: '1.1',
-        timestamp: new Date().toISOString(),
+    // When it fails, no receipt is produced and nothing that needs one runs.
+    const receipt: ActionReceipt | undefined = postDispatchStep(errors, 'createReceipt', () => {
+      if (viaEscalation && usedEscalationId) {
+        const receiptData: Omit<ActionReceipt, 'signature'> = {
+          receiptId: 'rcpt_' + uuidv4().slice(0, 12),
+          version: '1.1',
+          timestamp: new Date().toISOString(),
+          agentId: this.config.gatewayId,
+          delegationId: delegation.delegationId,
+          action: {
+            type: `gateway:${request.tool}`,
+            target: JSON.stringify(request.params),
+            scopeUsed: request.scopeRequired,
+            spend: request.spend
+          },
+          result: {
+            status: toolResult.success ? 'success' as const : 'failure' as const,
+            summary: toolResult.success
+              ? `Executed ${request.tool} via escalation ${usedEscalationId}`
+              : `Executed ${request.tool} via escalation with error: ${toolResult.error}`
+          },
+          delegationChain: [this.config.gatewayPublicKey],
+        }
+        const canonical = canonicalize(receiptData)
+        return { ...receiptData, signature: signData(canonical, this.config.gatewayPrivateKey) }
+      }
+      return createReceipt({
         agentId: this.config.gatewayId,
         delegationId: delegation.delegationId,
+        delegation: delegation,
         action: {
           type: `gateway:${request.tool}`,
           target: JSON.stringify(request.params),
@@ -965,68 +1038,53 @@ export class ProxyGateway {
         result: {
           status: toolResult.success ? 'success' as const : 'failure' as const,
           summary: toolResult.success
-            ? `Executed ${request.tool} via escalation ${usedEscalationId}`
-            : `Executed ${request.tool} via escalation with error: ${toolResult.error}`
+            ? `Executed ${request.tool} successfully`
+            : `Executed ${request.tool} with error: ${toolResult.error}`
         },
         delegationChain: [this.config.gatewayPublicKey],
-      }
-      const canonical = canonicalize(receiptData)
-      receipt = { ...receiptData, signature: signData(canonical, this.config.gatewayPrivateKey) }
-    } else {
-      receipt = createReceipt({
-        agentId: this.config.gatewayId,
-        delegationId: delegation.delegationId,
-        delegation: delegation,
-      action: {
-        type: `gateway:${request.tool}`,
-        target: JSON.stringify(request.params),
-        scopeUsed: request.scopeRequired,
-        spend: request.spend
-      },
-      result: {
-        status: toolResult.success ? 'success' as const : 'failure' as const,
-        summary: toolResult.success
-          ? `Executed ${request.tool} successfully`
-          : `Executed ${request.tool} with error: ${toolResult.error}`
-      },
-      delegationChain: [this.config.gatewayPublicKey],
-      privateKey: this.config.gatewayPrivateKey
+        privateKey: this.config.gatewayPrivateKey
+      })
     })
-    }
 
     // Step 8: Create policy receipt (links all 3 signatures)
-    const policyReceipt = createPolicyReceipt({
-      intent,
-      decision,
-      receipt,
-      verifierPrivateKey: this.config.gatewayPrivateKey
-    })
+    const policyReceipt = receipt
+      ? postDispatchStep(errors, 'createPolicyReceipt', () => createPolicyReceipt({
+        intent,
+        decision,
+        receipt,
+        verifierPrivateKey: this.config.gatewayPrivateKey
+      }))
+      : (errors.push('createPolicyReceipt: skipped, no receipt'), undefined)
 
     // Step 8.5: Obligation fulfillment check (Module 20)
     // Check if this receipt satisfies any pending obligations for this agent
     const obligationResolutions: ObligationResolution[] = []
     if (this.config.enableObligationMonitoring && agent.obligations && toolResult.success) {
-      const receiptForCheck = {
-        receiptId: receipt.receiptId,
-        action: { type: receipt.action.type, scopeUsed: receipt.action.scopeUsed },
-        params: request.params,
-        timestamp: receipt.timestamp,
-        toolError: undefined
-      }
-      for (const obligation of agent.obligations) {
-        if (obligation.status !== 'pending') continue
-        const fulfillment = checkFulfillment(obligation.evidence, [receiptForCheck])
-        if (fulfillment.fulfilled) {
-          const resolution = resolveObligation({
-            obligation,
-            receipts: [receiptForCheck],
-            gatewayId: this.config.gatewayId,
-            gatewayPrivateKey: this.config.gatewayPrivateKey
-          })
-          obligationResolutions.push(resolution)
-          obligation.status = 'fulfilled'
-          this.stats.obligationsFulfilled = (this.stats.obligationsFulfilled || 0) + 1
-          this.config.onObligationResolved?.(resolution)
+      if (!receipt) errors.push('checkFulfillment: skipped, no receipt')
+      else {
+        const receiptForCheck = {
+          receiptId: receipt.receiptId,
+          action: { type: receipt.action.type, scopeUsed: receipt.action.scopeUsed },
+          params: request.params,
+          timestamp: receipt.timestamp,
+          toolError: undefined
+        }
+        for (const obligation of agent.obligations) {
+          if (obligation.status !== 'pending') continue
+          const fulfillment = postDispatchStep(errors, 'checkFulfillment', () => checkFulfillment(obligation.evidence, [receiptForCheck]))
+          if (fulfillment?.fulfilled) {
+            const resolution = postDispatchStep(errors, 'resolveObligation', () => resolveObligation({
+              obligation,
+              receipts: [receiptForCheck],
+              gatewayId: this.config.gatewayId,
+              gatewayPrivateKey: this.config.gatewayPrivateKey
+            }))
+            if (!resolution) continue
+            obligationResolutions.push(resolution)
+            obligation.status = 'fulfilled'
+            this.stats.obligationsFulfilled = (this.stats.obligationsFulfilled || 0) + 1
+            postDispatchStep(errors, 'onObligationResolved', () => this.config.onObligationResolved?.(resolution))
+          }
         }
       }
     }
@@ -1036,52 +1094,16 @@ export class ProxyGateway {
     if (this.config.enableReputationGating && agent.reputation && agent.authorityTier) {
       const evidenceClass: EvidenceClass = request.evidenceClass ?? this.config.defaultEvidenceClass ?? 'standard'
       const success = toolResult.success
-      agent.reputation = updateReputationFromResult(agent.reputation, success, evidenceClass, {
+      const reputation = postDispatchStep(errors, 'updateReputationFromResult', () => updateReputationFromResult(agent.reputation!, success, evidenceClass, {
         principalHash: delegation.delegatedBy.slice(0, 16),  // first 16 chars as hash
         taskType: request.tool,
-      });
-      (this.stats.reputationUpdates as number)++
-
-      // Recompute tier
-      const newScore = computeEffectiveScore(agent.reputation.mu, agent.reputation.sigma)
-      const newTierDef = resolveAuthorityTier(newScore, agent.authorityTier.demotionCount)
-
-      // Check for demotion
-      if (shouldDemote(newScore, agent.authorityTier.tier) && agent.authorityTier.tier > 0) {
-        const oldTier = agent.authorityTier.tier
-        const demotion = triggerDemotion({
-          agentId: request.agentId,
-          principalId: agent.passport.passport.publicKey,
-          scope: request.scopeRequired,
-          currentTier: agent.authorityTier.tier,
-          cause: 'behavioral',
-          reason: `Score ${newScore.toFixed(1)} below demotion threshold`,
-        })
-        agent.authorityTier = {
-          ...agent.authorityTier,
-          tier: demotion.toTier,
-          name: DEFAULT_TIERS[demotion.toTier]?.name ?? 'recruit',
-          autonomyLevel: DEFAULT_TIERS[demotion.toTier]?.autonomyLevel ?? (1 as AutonomyLevel),
-          maxDelegationDepth: DEFAULT_TIERS[demotion.toTier]?.maxDelegationDepth ?? 0,
-          maxSpendPerAction: DEFAULT_TIERS[demotion.toTier]?.maxSpendPerAction ?? 0,
-          demotionCount: agent.authorityTier.demotionCount + 1,
-        };
-        (this.stats.demotions as number)++
-        this.config.onDemotion?.(request.agentId, oldTier, demotion.toTier, demotion.reason)
-      } else if (newTierDef.tier > agent.authorityTier.tier) {
-        // Promotion (automatic — formal promotion reviews are separate)
-        agent.authorityTier = {
-          ...agent.authorityTier,
-          tier: newTierDef.tier,
-          name: newTierDef.name,
-          autonomyLevel: newTierDef.autonomyLevel,
-          maxDelegationDepth: newTierDef.maxDelegationDepth,
-          maxSpendPerAction: newTierDef.maxSpendPerAction,
-          promotedAt: new Date().toISOString(),
-        }
+      }))
+      if (reputation) {
+        agent.reputation = reputation;
+        (this.stats.reputationUpdates as number)++
+        this.applyTierChange(errors, agent, request.agentId, request.scopeRequired)
+        postDispatchStep(errors, 'onReputationUpdated', () => this.config.onReputationUpdated?.(request.agentId, agent.reputation!, agent.authorityTier!))
       }
-
-      this.config.onReputationUpdated?.(request.agentId, agent.reputation, agent.authorityTier)
     }
 
     this.usedRequestIds.set(request.requestId, Date.now())
@@ -1089,7 +1111,8 @@ export class ProxyGateway {
     // Step 9: Produce execution envelope for cross-engine interop (optional)
     let envelope: ExecutionEnvelope | undefined
     if (this.config.produceEnvelope && toolResult.success) {
-      envelope = createExecutionEnvelope({
+      if (!policyReceipt) errors.push('createExecutionEnvelope: skipped, no policy receipt')
+      else envelope = postDispatchStep(errors, 'createExecutionEnvelope', () => createExecutionEnvelope({
         intent,
         decision,
         receipt: policyReceipt,
@@ -1102,36 +1125,42 @@ export class ProxyGateway {
         evaluationMethod: 'deterministic',
         signerPrivateKey: this.config.gatewayPrivateKey,
         signerPublicKey: this.config.gatewayPublicKey
-      })
+      }))
     }
 
-    const proof: GatewayProof = {
-      requestSignature: request.signature, decisionSignature: decision.signature,
-      receiptSignature: receipt.signature, policyReceipt
-    }
+    const proof: GatewayProof | undefined = receipt && policyReceipt
+      ? { requestSignature: request.signature, decisionSignature: decision.signature, receiptSignature: receipt.signature, policyReceipt }
+      : undefined
 
     // ── Constraint Architecture: Build constraint vector + authorization witness ──
-    const successEvals = this.buildSuccessEvaluations(request, delegation)
-    const constraintVector = this.buildConstraintVector('permitted', successEvals, [])
-    const authWitness = this.buildAuthorizationWitness(request, delegation, constraintVector)
-    const authRef = this.buildAuthorizationRef(authWitness)
+    const successEvals = postDispatchStep(errors, 'buildSuccessEvaluations', () => this.buildSuccessEvaluations(request, delegation))
+    const constraintVector = successEvals
+      ? postDispatchStep(errors, 'buildConstraintVector', () => this.buildConstraintVector('permitted', successEvals, []))
+      : undefined
+    const authWitness = constraintVector
+      ? postDispatchStep(errors, 'buildAuthorizationWitness', () => this.buildAuthorizationWitness(request, delegation, constraintVector))
+      : undefined
+    const authRef = authWitness
+      ? postDispatchStep(errors, 'buildAuthorizationRef', () => this.buildAuthorizationRef(authWitness))
+      : undefined
 
     // Attach authorization ref to receipt (forensic link)
-    receipt.authorizationRef = authRef
+    if (receipt && authRef) receipt.authorizationRef = authRef
 
     // ── Dispute overlay on successful result (defeasible, not lattice) ──
-    if (overlay.hasActiveDispute) {
+    if (overlay.hasActiveDispute && constraintVector) {
       constraintVector.disputeOverlay = overlay
     }
 
     // ── Receipt maturation: starts 'maturing', finalized after witness or TTL ──
-    if (this.config.witnessPolicy) {
+    if (this.config.witnessPolicy && receipt) {
       receipt.finality = { status: 'maturing', since: new Date().toISOString(),
         challengeWindowEnds: new Date(Date.now() + (this.config.witnessPolicy.maturationWindow ?? 300) * 1000).toISOString() }
     }
 
     const result: ToolCallResult = {
       executed: true, requestId: request.requestId,
+      outcome: toolResult.success ? 'succeeded' : 'tool_reported_failure',
       result: toolResult.result, toolError: toolResult.success ? undefined : toolResult.error,
       proof, receipt, decision,
       sao, flowCheck: flowCheckResult,
@@ -1149,28 +1178,31 @@ export class ProxyGateway {
 
     // ── Fidelity probe scheduling ──
     if (this.config.enableFidelityGating && this.config.onProbeRequired) {
-      const schedule = this.config.probeSchedule ?? DEFAULT_PROBE_SCHEDULE
-      const substrateChanged = agent.fidelityAttestation?.fidelity.substrate !== agent.lastKnownSubstrate
-        && agent.lastKnownSubstrate !== undefined
-      if (agent.fidelityAttestation?.fidelity.substrate) {
-        agent.lastKnownSubstrate = agent.fidelityAttestation.fidelity.substrate
-      }
-      const probeNeeded = shouldProbe(schedule, {
-        isDelegationEvent: false,
-        turnNumber: agent.turnCount ?? 0,
-        lastProbeTurn: agent.lastProbeTurn ?? 0,
-        substrateChanged,
-        highStakes: request.reversibility === 'irreversible',
+      const probe = postDispatchStep(errors, 'shouldProbe', () => {
+        const schedule = this.config.probeSchedule ?? DEFAULT_PROBE_SCHEDULE
+        const substrateChanged = agent.fidelityAttestation?.fidelity.substrate !== agent.lastKnownSubstrate
+          && agent.lastKnownSubstrate !== undefined
+        if (agent.fidelityAttestation?.fidelity.substrate) {
+          agent.lastKnownSubstrate = agent.fidelityAttestation.fidelity.substrate
+        }
+        const probeNeeded = shouldProbe(schedule, {
+          isDelegationEvent: false,
+          turnNumber: agent.turnCount ?? 0,
+          lastProbeTurn: agent.lastProbeTurn ?? 0,
+          substrateChanged,
+          highStakes: request.reversibility === 'irreversible',
+        })
+        return { probeNeeded, substrateChanged }
       })
-      if (probeNeeded) {
+      if (probe?.probeNeeded) {
         agent.lastProbeTurn = agent.turnCount ?? 0
-        const reason = substrateChanged ? 'substrate_change' : 'turn_interval'
-        this.config.onProbeRequired(request.agentId, reason)
+        const reason = probe.substrateChanged ? 'substrate_change' : 'turn_interval'
+        postDispatchStep(errors, 'onProbeRequired', () => this.config.onProbeRequired!(request.agentId, reason))
       }
     }
 
     // ── Near-miss alerting (Phase 3) ──
-    this.checkNearMisses(request, delegation, constraintVector)
+    if (constraintVector) postDispatchStep(errors, 'checkNearMisses', () => this.checkNearMisses(request, delegation, constraintVector))
 
     // ── Persist to storage (write-through) ──
     if (this.storage && receipt) {
@@ -1185,9 +1217,21 @@ export class ProxyGateway {
           })
         } catch (_e) { /* storage write failure — in-memory state is still authoritative */ }
       })()
+    } else {
+      this.persistNonce(request.requestId)
     }
 
-    this.config.onToolCall?.(request, result)
+    this.reportToolCall(request, result, errors)
+    return result
+  }
+
+  /** Result for a dispatched call whose effect is unknown: the executor threw or returned no result object. */
+  private finishUnknownToolCall(request: ToolCallRequest, decision: PolicyDecision, toolError: string): ToolCallResult {
+    this.stats.totalToolErrors++
+    this.usedRequestIds.set(request.requestId, Date.now())
+    this.persistNonce(request.requestId)
+    const result: ToolCallResult = { executed: true, outcome: 'unknown', requestId: request.requestId, toolError, decision }
+    this.reportToolCall(request, result, [])
     return result
   }
 
@@ -1241,17 +1285,24 @@ export class ProxyGateway {
     this.stats.totalPermitted++
     const nonce = uuidv4()
     const ttlMs = this.config.approvalTTLSeconds * 1000
+    // Store a frozen snapshot of exactly what intent.action.target committed to,
+    // so later changes to request.params cannot reach the dispatched parameters.
+    const paramsSnapshot = deepFreeze(
+      (intent.action.target === undefined ? request.params : JSON.parse(intent.action.target)) as Record<string, unknown>
+    )
     const approval: GatewayApproval = {
       approvalId: uuidv4(), requestId: request.requestId, agentId: request.agentId,
-      tool: request.tool, params: request.params, scopeRequired: request.scopeRequired,
+      tool: request.tool, params: paramsSnapshot, scopeRequired: request.scopeRequired,
       delegationId: delegation.delegationId, intent, decision,
       expiresAt: new Date(Date.now() + ttlMs).toISOString(), nonce, consumed: false,
       spend: request.spend, evidenceClass: request.evidenceClass, // V5-MED-1: carry through from request
     }
 
     this.approvals.set(approval.approvalId, approval)
+    this.approvalRequests.set(approval, deepFreeze(structuredClone({ ...request, params: paramsSnapshot })))
     this.stats.pendingApprovals = Array.from(this.approvals.values()).filter(a => !a.consumed).length
-    return { approved: true, approval }
+    // Hand back a copy; the stored approval is only reachable through approvalId.
+    return { approved: true, approval: structuredClone(approval) }
   }
 
   async executeApproval(approvalId: string): Promise<ToolCallResult> {
@@ -1265,24 +1316,6 @@ export class ProxyGateway {
     if (!agent) return { executed: false, requestId: approval.requestId, denialReason: 'Agent unregistered since approval' }
     const delegation = agent.delegations.get(approval.delegationId)
     if (!delegation) return { executed: false, requestId: approval.requestId, denialReason: 'Delegation removed since approval' }
-
-    if (this.config.recheckRevocationOnExecute) {
-      this.stats.revocationRechecksTriggered++
-      const delegationStatus = verifyDelegation(delegation, { cachedRevocationState: this.cachedRevocationState(delegation.delegationId) })
-      const liveStateValid = delegationStatus.valid && !delegationStatus.expired && !delegationStatus.revoked
-      const ccpResult = evaluateCredentialCheck({
-        delegation,
-        acceptanceStamp: this.acceptanceStamps.get(delegation.delegationId),
-        liveStateValid,
-      })
-      if (!ccpResult.permitted) {
-        return {
-          executed: false,
-          requestId: approval.requestId,
-          denialReason: ccpResult.reason ?? 'Delegation invalidated since approval',
-        }
-      }
-    }
 
     // ═══ V2-CRIT-1 FIX: All enforcement steps from processToolCall now applied here ═══
     // Per-agent sequential execution (concurrency protection)
@@ -1316,6 +1349,81 @@ export class ProxyGateway {
     agent: RegisteredAgent,
     delegation: Delegation
   ): Promise<ToolCallResult> {
+    // The stored intent must still verify under the gateway key, over the same
+    // preimage createActionIntent signed. Refuse before any side effect, and
+    // leave the approval unconsumed.
+    const { signature: intentSignature, ...unsignedIntent } = approval.intent
+    let intentVerified = false
+    try { intentVerified = verify(canonicalize(unsignedIntent), intentSignature, this.config.gatewayPublicKey) } catch { intentVerified = false }
+    if (!intentVerified) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: 'Approved intent signature does not verify',
+        decision: structuredClone(approval.decision)
+      }
+    }
+
+    // The stored params must still serialize to what the signed intent committed
+    // to. Refuse before any side effect, and leave the approval unconsumed.
+    if (JSON.stringify(approval.params) !== approval.intent.action.target) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: 'Approval parameters do not match the approved intent',
+        decision: structuredClone(approval.decision)
+      }
+    }
+
+    // Every other dispatched field must match what the signed intent committed to.
+    const fieldMismatch =
+      approval.tool !== approval.intent.action.type ? 'Approval tool does not match the approved intent'
+      : approval.delegationId !== approval.intent.delegationId ? 'Approval delegation does not match the approved intent'
+      : approval.scopeRequired !== approval.intent.action.scopeRequired ? 'Approval scope does not match the approved intent'
+      : canonicalize(approval.spend) !== canonicalize(approval.intent.action.spend) ? 'Approval spend does not match the approved intent'
+      : null
+    if (fieldMismatch) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: fieldMismatch,
+        decision: structuredClone(approval.decision)
+      }
+    }
+
+    // The stored decision must still verify under the gateway key, over the same
+    // preimage evaluateIntent signed.
+    const { signature: decisionSignature, ...unsignedDecision } = approval.decision
+    let decisionVerified = false
+    try { decisionVerified = verify(canonicalize(unsignedDecision), decisionSignature, this.config.gatewayPublicKey) } catch { decisionVerified = false }
+    if (!decisionVerified) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: 'Approved decision signature does not verify',
+        decision: structuredClone(approval.decision)
+      }
+    }
+
+    // A genuine gateway decision is only admissible for the intent it evaluated,
+    // and only with a verdict approve() admits. createPolicyReceipt and
+    // createExecutionEnvelope would otherwise throw after dispatch.
+    const decisionMismatch =
+      approval.decision.intentId !== approval.intent.intentId ? 'Approved decision does not reference the approved intent'
+      : approval.decision.verdict !== 'permit' && approval.decision.verdict !== 'narrow' ? 'Approved decision verdict is not admissible'
+      : this.config.produceEnvelope && approval.decision.verdict === 'narrow' && approval.decision.constraints
+        && !(Array.isArray(approval.decision.constraints) && approval.decision.constraints.every(c => typeof c === 'string'))
+        ? 'Approved decision constraints cannot be recorded in the execution envelope'
+      : null
+    if (decisionMismatch) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: decisionMismatch,
+        decision: structuredClone(approval.decision)
+      }
+    }
+
     // Frame TTL auto-rotation (F-2 fix)
     if (this.config.enableCrossChainEnforcement && agent.executionFrame) {
       if (isFrameExpired(agent.executionFrame)) {
@@ -1338,7 +1446,7 @@ export class ProxyGateway {
         return {
           executed: false, requestId: approval.requestId,
           denialReason: `Governance stale at execution: agent attested to v${agentVersion ?? 'none'}, current is v${currentVersion}`,
-          decision: approval.decision
+          decision: structuredClone(approval.decision)
         }
       }
     }
@@ -1372,7 +1480,7 @@ export class ProxyGateway {
           return {
             executed: false, requestId: approval.requestId,
             denialReason: `Cross-chain blocked: ${flowCheckResult.reason}`,
-            decision: approval.decision, flowCheck: flowCheckResult
+            decision: structuredClone(approval.decision), flowCheck: flowCheckResult
           }
         }
         if (flowCheckResult.verdict === 'permitted') {
@@ -1389,7 +1497,7 @@ export class ProxyGateway {
         return {
           executed: false, requestId: approval.requestId,
           denialReason: `Cross-chain permit ${flowCheckResult.permitId} revoked/expired between approval and execution`,
-          decision: approval.decision
+          decision: structuredClone(approval.decision)
         }
       }
     }
@@ -1410,7 +1518,38 @@ export class ProxyGateway {
         (this.stats.tierDenials as number)++
         const reason = `Tier ${tierCheck.currentTier} (${agent.authorityTier.name}) insufficient`
         this.config.onTierDenied?.(approval.agentId, tierCheck)
-        return { executed: false, requestId: approval.requestId, denialReason: reason, decision: approval.decision, tierCheck }
+        return { executed: false, requestId: approval.requestId, denialReason: reason, decision: structuredClone(approval.decision), tierCheck }
+      }
+    }
+
+    // draft-pidlisnyi-aps-04 7.3.2: time and revocation state are rechecked at
+    // the moment the approval is consumed, whatever recheckRevocationOnExecute
+    // says. createReceipt would otherwise throw after dispatch.
+    const delegationRefusal = this.delegationRefusal(delegation)
+    if (delegationRefusal) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: delegationRefusal,
+        decision: structuredClone(approval.decision)
+      }
+    }
+
+    if (this.config.recheckRevocationOnExecute) {
+      this.stats.revocationRechecksTriggered++
+      const delegationStatus = verifyDelegation(delegation, { cachedRevocationState: this.cachedRevocationState(delegation.delegationId) })
+      const liveStateValid = delegationStatus.valid && !delegationStatus.expired && !delegationStatus.revoked
+      const ccpResult = evaluateCredentialCheck({
+        delegation,
+        acceptanceStamp: this.acceptanceStamps.get(delegation.delegationId),
+        liveStateValid,
+      })
+      if (!ccpResult.permitted) {
+        return {
+          executed: false,
+          requestId: approval.requestId,
+          denialReason: ccpResult.reason ?? 'Delegation invalidated since approval',
+        }
       }
     }
 
@@ -1418,43 +1557,60 @@ export class ProxyGateway {
     approval.consumed = true
     this.usedRequestIds.set(approval.requestId, Date.now())
 
-    let toolResult: { success: boolean; result?: unknown; error?: string }
-    try { toolResult = await this.executor(approval.tool, approval.params) }
-    catch (err: unknown) { this.stats.totalToolErrors++; return { executed: true, requestId: approval.requestId, toolError: err instanceof Error ? err.message : String(err), decision: approval.decision } }
+    let dispatched: unknown
+    try { dispatched = await this.executor(approval.tool, approval.params) }
+    catch (err: unknown) {
+      // The approval stays consumed: the call was dispatched and its effect is unknown.
+      return this.finishUnknownApproval(approval, errorMessage(err))
+    }
+    const toolResult = readToolResult(dispatched)
+    if (!toolResult) return this.finishUnknownApproval(approval, 'Executor did not return a result object')
 
+    // The executor has run. Nothing below may throw out of executeApproval: each
+    // step's failure is named in postDispatchErrors and the rest still runs.
+    const errors: string[] = []
     if (toolResult.success) { this.stats.totalExecuted++ } else { this.stats.totalToolErrors++ }
 
     // Taint recording + SAO wrapping (step 6.5)
     let sao: SignedAuthorityObject | undefined
     if (this.config.enableCrossChainEnforcement && agent.executionFrame && toolResult.success) {
-      const taintLabel = createTaintLabel(delegation.delegatedBy, delegation.delegationId, delegation.delegationId, 'same-context-only')
-      agent.executionFrame = recordAccess(agent.executionFrame, taintLabel)
-      sao = createSAO(toolResult.result, taintLabel, this.config.gatewayPrivateKey, this.config.gatewayPublicKey)
+      const taintLabel = postDispatchStep(errors, 'createTaintLabel', () => createTaintLabel(delegation.delegatedBy, delegation.delegationId, delegation.delegationId, 'same-context-only'))
+      if (taintLabel) {
+        const frame = postDispatchStep(errors, 'recordAccess', () => recordAccess(agent.executionFrame!, taintLabel))
+        if (frame) agent.executionFrame = frame
+        sao = postDispatchStep(errors, 'createSAO', () => createSAO(toolResult.result, taintLabel, this.config.gatewayPrivateKey, this.config.gatewayPublicKey))
+      }
     }
 
-    // Receipt generation
-    const receipt = createReceipt({
+    // Receipt generation. When it fails, no receipt is produced and nothing that needs one runs.
+    const receipt = postDispatchStep(errors, 'createReceipt', () => createReceipt({
       agentId: this.config.gatewayId, delegationId: approval.delegationId, delegation,
       action: { type: `gateway:${approval.tool}`, target: JSON.stringify(approval.params), scopeUsed: approval.scopeRequired },
       result: { status: toolResult.success ? 'success' as const : 'failure' as const, summary: toolResult.success ? `Executed ${approval.tool} successfully` : `Executed ${approval.tool} with error: ${toolResult.error}` },
       delegationChain: [this.config.gatewayPublicKey], privateKey: this.config.gatewayPrivateKey
-    })
+    }))
 
-    const policyReceipt = createPolicyReceipt({ intent: approval.intent, decision: approval.decision, receipt, verifierPrivateKey: this.config.gatewayPrivateKey })
+    const policyReceipt = receipt
+      ? postDispatchStep(errors, 'createPolicyReceipt', () => createPolicyReceipt({ intent: approval.intent, decision: approval.decision, receipt, verifierPrivateKey: this.config.gatewayPrivateKey }))
+      : (errors.push('createPolicyReceipt: skipped, no receipt'), undefined)
 
     // Obligation fulfillment check (Module 20)
     const obligationResolutions: ObligationResolution[] = []
     if (this.config.enableObligationMonitoring && agent.obligations && toolResult.success) {
-      const receiptForCheck = { receiptId: receipt.receiptId, action: { type: receipt.action.type, scopeUsed: receipt.action.scopeUsed }, params: approval.params, timestamp: receipt.timestamp, toolError: undefined }
-      for (const obligation of agent.obligations) {
-        if (obligation.status !== 'pending') continue
-        const fulfillment = checkFulfillment(obligation.evidence, [receiptForCheck])
-        if (fulfillment.fulfilled) {
-          const resolution = resolveObligation({ obligation, receipts: [receiptForCheck], gatewayId: this.config.gatewayId, gatewayPrivateKey: this.config.gatewayPrivateKey })
-          obligationResolutions.push(resolution)
-          obligation.status = 'fulfilled'
-          this.stats.obligationsFulfilled = (this.stats.obligationsFulfilled || 0) + 1
-          this.config.onObligationResolved?.(resolution)
+      if (!receipt) errors.push('checkFulfillment: skipped, no receipt')
+      else {
+        const receiptForCheck = { receiptId: receipt.receiptId, action: { type: receipt.action.type, scopeUsed: receipt.action.scopeUsed }, params: approval.params, timestamp: receipt.timestamp, toolError: undefined }
+        for (const obligation of agent.obligations) {
+          if (obligation.status !== 'pending') continue
+          const fulfillment = postDispatchStep(errors, 'checkFulfillment', () => checkFulfillment(obligation.evidence, [receiptForCheck]))
+          if (fulfillment?.fulfilled) {
+            const resolution = postDispatchStep(errors, 'resolveObligation', () => resolveObligation({ obligation, receipts: [receiptForCheck], gatewayId: this.config.gatewayId, gatewayPrivateKey: this.config.gatewayPrivateKey }))
+            if (!resolution) continue
+            obligationResolutions.push(resolution)
+            obligation.status = 'fulfilled'
+            this.stats.obligationsFulfilled = (this.stats.obligationsFulfilled || 0) + 1
+            postDispatchStep(errors, 'onObligationResolved', () => this.config.onObligationResolved?.(resolution))
+          }
         }
       }
     }
@@ -1462,38 +1618,34 @@ export class ProxyGateway {
     // Reputation update (step 8.7 parity)
     if (this.config.enableReputationGating && agent.reputation && agent.authorityTier) {
       const evidenceClass: EvidenceClass = approval.evidenceClass ?? this.config.defaultEvidenceClass ?? 'standard'
-      agent.reputation = updateReputationFromResult(agent.reputation, toolResult.success, evidenceClass, {
+      const reputation = postDispatchStep(errors, 'updateReputationFromResult', () => updateReputationFromResult(agent.reputation!, toolResult.success, evidenceClass, {
         principalHash: delegation.delegatedBy.slice(0, 16),
         taskType: approval.tool,
-      });
-      (this.stats.reputationUpdates as number)++
-      const newScore = computeEffectiveScore(agent.reputation.mu, agent.reputation.sigma)
-      const newTierDef = resolveAuthorityTier(newScore, agent.authorityTier.demotionCount)
-      if (shouldDemote(newScore, agent.authorityTier.tier) && agent.authorityTier.tier > 0) {
-        const oldTier = agent.authorityTier.tier
-        const demotion = triggerDemotion({ agentId: approval.agentId, principalId: agent.passport.passport.publicKey, scope: approval.scopeRequired, currentTier: agent.authorityTier.tier, cause: 'behavioral', reason: `Score ${newScore.toFixed(1)} below demotion threshold` })
-        agent.authorityTier = { ...agent.authorityTier, tier: demotion.toTier, name: DEFAULT_TIERS[demotion.toTier]?.name ?? 'recruit', autonomyLevel: DEFAULT_TIERS[demotion.toTier]?.autonomyLevel ?? (1 as AutonomyLevel), maxDelegationDepth: DEFAULT_TIERS[demotion.toTier]?.maxDelegationDepth ?? 0, maxSpendPerAction: DEFAULT_TIERS[demotion.toTier]?.maxSpendPerAction ?? 0, demotionCount: agent.authorityTier.demotionCount + 1 };
-        (this.stats.demotions as number)++
-        this.config.onDemotion?.(approval.agentId, oldTier, demotion.toTier, demotion.reason)
-      } else if (newTierDef.tier > agent.authorityTier.tier) {
-        agent.authorityTier = { ...agent.authorityTier, tier: newTierDef.tier, name: newTierDef.name, autonomyLevel: newTierDef.autonomyLevel, maxDelegationDepth: newTierDef.maxDelegationDepth, maxSpendPerAction: newTierDef.maxSpendPerAction, promotedAt: new Date().toISOString() }
+      }))
+      if (reputation) {
+        agent.reputation = reputation;
+        (this.stats.reputationUpdates as number)++
+        this.applyTierChange(errors, agent, approval.agentId, approval.scopeRequired)
+        postDispatchStep(errors, 'onReputationUpdated', () => this.config.onReputationUpdated?.(approval.agentId, agent.reputation!, agent.authorityTier!))
       }
-      this.config.onReputationUpdated?.(approval.agentId, agent.reputation, agent.authorityTier)
     }
 
     // Execution envelope (step 9)
     let envelope: ExecutionEnvelope | undefined
     if (this.config.produceEnvelope && toolResult.success) {
-      envelope = createExecutionEnvelope({
+      if (!policyReceipt) errors.push('createExecutionEnvelope: skipped, no policy receipt')
+      else envelope = postDispatchStep(errors, 'createExecutionEnvelope', () => createExecutionEnvelope({
         intent: approval.intent, decision: approval.decision, receipt: policyReceipt, delegation,
         runId: approval.requestId, agentDid: `did:aps:${approval.agentId}`,
         evaluatorDid: `did:aps:${this.config.gatewayPublicKey}`, revocationStatus: 'active',
         chainDepth: delegation.currentDepth, evaluationMethod: 'deterministic',
         signerPrivateKey: this.config.gatewayPrivateKey, signerPublicKey: this.config.gatewayPublicKey
-      })
+      }))
     }
 
-    const proof: GatewayProof = { requestSignature: approval.intent.signature, decisionSignature: approval.decision.signature, receiptSignature: receipt.signature, policyReceipt }
+    const proof: GatewayProof | undefined = receipt && policyReceipt
+      ? { requestSignature: approval.intent.signature, decisionSignature: approval.decision.signature, receiptSignature: receipt.signature, policyReceipt }
+      : undefined
     this.stats.pendingApprovals = Array.from(this.approvals.values()).filter(a => !a.consumed).length
 
     // ── Persist to storage (write-through, 2-phase path) ──
@@ -1509,17 +1661,97 @@ export class ProxyGateway {
           })
         } catch (_e) { /* storage write failure — in-memory state is still authoritative */ }
       })()
+    } else {
+      this.persistNonce(approval.requestId)
     }
 
-    return {
+    const result: ToolCallResult = {
       executed: true, requestId: approval.requestId,
+      outcome: toolResult.success ? 'succeeded' : 'tool_reported_failure',
       result: toolResult.result, toolError: toolResult.success ? undefined : toolResult.error,
-      proof, receipt, decision: approval.decision,
+      proof, receipt, decision: structuredClone(approval.decision),
       sao, flowCheck: flowCheckResult,
       obligationResolutions: obligationResolutions.length > 0 ? obligationResolutions : undefined,
       envelope,
       tierCheck
     }
+    this.reportApprovalToolCall(approval, result, errors)
+    return result
+  }
+
+  /** Result for a dispatched approval whose effect is unknown: the executor threw or returned no result object. */
+  private finishUnknownApproval(approval: GatewayApproval, toolError: string): ToolCallResult {
+    this.stats.totalToolErrors++
+    this.persistNonce(approval.requestId)
+    const result: ToolCallResult = { executed: true, outcome: 'unknown', requestId: approval.requestId, toolError, decision: structuredClone(approval.decision) }
+    this.reportApprovalToolCall(approval, result, [])
+    return result
+  }
+
+  /** Recompute the agent's tier after a reputation update, demoting or promoting. Never throws. */
+  private applyTierChange(errors: string[], agent: RegisteredAgent, agentId: string, scope: string): void {
+    const tier = agent.authorityTier!
+    const next = postDispatchStep(errors, 'resolveAuthorityTier', () => {
+      const newScore = computeEffectiveScore(agent.reputation!.mu, agent.reputation!.sigma)
+      return { newScore, newTierDef: resolveAuthorityTier(newScore, tier.demotionCount), demote: shouldDemote(newScore, tier.tier) && tier.tier > 0 }
+    })
+    if (!next) return
+    if (next.demote) {
+      const oldTier = tier.tier
+      const demotion = postDispatchStep(errors, 'triggerDemotion', () => triggerDemotion({
+        agentId, principalId: agent.passport.passport.publicKey, scope, currentTier: tier.tier,
+        cause: 'behavioral', reason: `Score ${next.newScore.toFixed(1)} below demotion threshold`,
+      }))
+      if (!demotion) return
+      agent.authorityTier = {
+        ...tier,
+        tier: demotion.toTier,
+        name: DEFAULT_TIERS[demotion.toTier]?.name ?? 'recruit',
+        autonomyLevel: DEFAULT_TIERS[demotion.toTier]?.autonomyLevel ?? (1 as AutonomyLevel),
+        maxDelegationDepth: DEFAULT_TIERS[demotion.toTier]?.maxDelegationDepth ?? 0,
+        maxSpendPerAction: DEFAULT_TIERS[demotion.toTier]?.maxSpendPerAction ?? 0,
+        demotionCount: tier.demotionCount + 1,
+      };
+      (this.stats.demotions as number)++
+      postDispatchStep(errors, 'onDemotion', () => this.config.onDemotion?.(agentId, oldTier, demotion.toTier, demotion.reason))
+    } else if (next.newTierDef.tier > tier.tier) {
+      // Promotion (automatic — formal promotion reviews are separate)
+      agent.authorityTier = {
+        ...tier,
+        tier: next.newTierDef.tier,
+        name: next.newTierDef.name,
+        autonomyLevel: next.newTierDef.autonomyLevel,
+        maxDelegationDepth: next.newTierDef.maxDelegationDepth,
+        maxSpendPerAction: next.newTierDef.maxSpendPerAction,
+        promotedAt: new Date().toISOString(),
+      }
+    }
+  }
+
+  /** Report a dispatched approval to onToolCall with the request it was approved from. */
+  private reportApprovalToolCall(approval: GatewayApproval, result: ToolCallResult, errors: string[]): void {
+    const request = this.approvalRequests.get(approval)
+    this.reportToolCall(request, result, errors)
+  }
+
+  /** Attach post-dispatch errors to a dispatched result and report it to onToolCall. Never throws. */
+  private reportToolCall(request: ToolCallRequest | undefined, result: ToolCallResult, errors: string[]): void {
+    if (errors.length > 0) result.postDispatchErrors = errors
+    if (request) postDispatchStep(errors, 'onToolCall', () => this.config.onToolCall?.(request, result))
+    if (errors.length > 0) result.postDispatchErrors = errors
+  }
+
+  /** Persist a dispatched requestId when no receipt is written (effect unknown). */
+  private persistNonce(requestId: string): void {
+    if (!this.storage) return
+    const s = this.storage
+    ;(async () => {
+      try {
+        await s.transaction(async (tx) => {
+          await tx.checkAndStoreNonce(requestId, Math.floor((this.config.requestIdTTLMs || 3600000) / 1000))
+        })
+      } catch (_e) { /* storage write failure — in-memory state is still authoritative */ }
+    })()
   }
 
   clearExpired(): number {
@@ -1724,8 +1956,9 @@ export class ProxyGateway {
 
   getStats(): GatewayStats { return { ...this.stats } }
 
+  /** Copies of the agent's approvals; the stored approvals are not handed out. */
   getAgentApprovals(agentId: string): GatewayApproval[] {
-    return Array.from(this.approvals.values()).filter(a => a.agentId === agentId)
+    return Array.from(this.approvals.values()).filter(a => a.agentId === agentId).map(a => structuredClone(a))
   }
 
   // ── Cross-Chain + Obligation Management ──
@@ -1938,6 +2171,21 @@ export class ProxyGateway {
    * validity checkpoint feeds the store's view in explicitly — the same
    * pattern DelegationStore.createReceipt uses.
    */
+  /** Why `delegation` cannot back a dispatch right now, or null. Covers everything
+   *  createReceipt's verifyDelegation rejects, plus live revocation. */
+  private delegationRefusal(delegation: Delegation): string | null {
+    const { signature, ...unsigned } = delegation
+    let signed = false
+    try { signed = verify(canonicalize(unsigned), signature, delegation.delegatedBy) } catch { signed = false }
+    if (!signed) return 'Delegation signature does not verify'
+    if (this.delegationStore.getRevocation(delegation.delegationId)) return 'Delegation revoked'
+    const status = verifyDelegation(delegation)
+    if (status.expired) return 'Delegation expired'
+    if (status.notYetValid) return 'Delegation not yet valid'
+    if (!status.valid) return `Delegation invalid: ${status.errors.join(', ')}`
+    return null
+  }
+
   private cachedRevocationState(delegationId: string): { revoked: boolean; checkedAt: string } | undefined {
     return this.delegationStore.getRevocation(delegationId)
       ? { revoked: true, checkedAt: new Date().toISOString() }
