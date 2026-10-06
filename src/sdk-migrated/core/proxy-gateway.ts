@@ -1369,6 +1369,21 @@ export class ProxyGateway {
       }
     }
 
+    // Every other dispatched field must match what the signed intent committed to.
+    const fieldMismatch =
+      approval.tool !== approval.intent.action.type ? 'Approval tool does not match the approved intent'
+      : approval.scopeRequired !== approval.intent.action.scopeRequired ? 'Approval scope does not match the approved intent'
+      : canonicalize(approval.spend) !== canonicalize(approval.intent.action.spend) ? 'Approval spend does not match the approved intent'
+      : null
+    if (fieldMismatch) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: fieldMismatch,
+        decision: structuredClone(approval.decision)
+      }
+    }
+
     // Frame TTL auto-rotation (F-2 fix)
     if (this.config.enableCrossChainEnforcement && agent.executionFrame) {
       if (isFrameExpired(agent.executionFrame)) {
