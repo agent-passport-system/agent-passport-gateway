@@ -86,6 +86,14 @@ import type {
   DataGateway,
 } from 'agent-passport-system'
 
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const key of Object.keys(value)) deepFreeze((value as Record<string, unknown>)[key])
+    Object.freeze(value)
+  }
+  return value
+}
+
 
 // ══════════════════════════════════════
 // PROXY GATEWAY CLASS
@@ -1241,9 +1249,14 @@ export class ProxyGateway {
     this.stats.totalPermitted++
     const nonce = uuidv4()
     const ttlMs = this.config.approvalTTLSeconds * 1000
+    // Store a frozen snapshot of exactly what intent.action.target committed to,
+    // so later changes to request.params cannot reach the dispatched parameters.
+    const paramsSnapshot = deepFreeze(
+      (intent.action.target === undefined ? request.params : JSON.parse(intent.action.target)) as Record<string, unknown>
+    )
     const approval: GatewayApproval = {
       approvalId: uuidv4(), requestId: request.requestId, agentId: request.agentId,
-      tool: request.tool, params: request.params, scopeRequired: request.scopeRequired,
+      tool: request.tool, params: paramsSnapshot, scopeRequired: request.scopeRequired,
       delegationId: delegation.delegationId, intent, decision,
       expiresAt: new Date(Date.now() + ttlMs).toISOString(), nonce, consumed: false,
       spend: request.spend, evidenceClass: request.evidenceClass, // V5-MED-1: carry through from request
@@ -1251,7 +1264,8 @@ export class ProxyGateway {
 
     this.approvals.set(approval.approvalId, approval)
     this.stats.pendingApprovals = Array.from(this.approvals.values()).filter(a => !a.consumed).length
-    return { approved: true, approval }
+    // Hand back a copy; the stored approval is only reachable through approvalId.
+    return { approved: true, approval: structuredClone(approval) }
   }
 
   async executeApproval(approvalId: string): Promise<ToolCallResult> {
@@ -1316,6 +1330,17 @@ export class ProxyGateway {
     agent: RegisteredAgent,
     delegation: Delegation
   ): Promise<ToolCallResult> {
+    // The stored params must still serialize to what the signed intent committed
+    // to. Refuse before any side effect, and leave the approval unconsumed.
+    if (JSON.stringify(approval.params) !== approval.intent.action.target) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: 'Approval parameters do not match the approved intent',
+        decision: approval.decision
+      }
+    }
+
     // Frame TTL auto-rotation (F-2 fix)
     if (this.config.enableCrossChainEnforcement && agent.executionFrame) {
       if (isFrameExpired(agent.executionFrame)) {
