@@ -1347,7 +1347,7 @@ export class ProxyGateway {
       return {
         executed: false, requestId: approval.requestId,
         denialReason: 'Approval parameters do not match the approved intent',
-        decision: approval.decision
+        decision: structuredClone(approval.decision)
       }
     }
 
@@ -1373,7 +1373,7 @@ export class ProxyGateway {
         return {
           executed: false, requestId: approval.requestId,
           denialReason: `Governance stale at execution: agent attested to v${agentVersion ?? 'none'}, current is v${currentVersion}`,
-          decision: approval.decision
+          decision: structuredClone(approval.decision)
         }
       }
     }
@@ -1407,7 +1407,7 @@ export class ProxyGateway {
           return {
             executed: false, requestId: approval.requestId,
             denialReason: `Cross-chain blocked: ${flowCheckResult.reason}`,
-            decision: approval.decision, flowCheck: flowCheckResult
+            decision: structuredClone(approval.decision), flowCheck: flowCheckResult
           }
         }
         if (flowCheckResult.verdict === 'permitted') {
@@ -1424,7 +1424,7 @@ export class ProxyGateway {
         return {
           executed: false, requestId: approval.requestId,
           denialReason: `Cross-chain permit ${flowCheckResult.permitId} revoked/expired between approval and execution`,
-          decision: approval.decision
+          decision: structuredClone(approval.decision)
         }
       }
     }
@@ -1445,7 +1445,7 @@ export class ProxyGateway {
         (this.stats.tierDenials as number)++
         const reason = `Tier ${tierCheck.currentTier} (${agent.authorityTier.name}) insufficient`
         this.config.onTierDenied?.(approval.agentId, tierCheck)
-        return { executed: false, requestId: approval.requestId, denialReason: reason, decision: approval.decision, tierCheck }
+        return { executed: false, requestId: approval.requestId, denialReason: reason, decision: structuredClone(approval.decision), tierCheck }
       }
     }
 
@@ -1458,7 +1458,7 @@ export class ProxyGateway {
     catch (err: unknown) {
       // The approval stays consumed: the call was dispatched and its effect is unknown.
       this.stats.totalToolErrors++
-      return { executed: true, outcome: 'unknown', requestId: approval.requestId, toolError: err instanceof Error ? err.message : String(err), decision: approval.decision }
+      return { executed: true, outcome: 'unknown', requestId: approval.requestId, toolError: err instanceof Error ? err.message : String(err), decision: structuredClone(approval.decision) }
     }
 
     if (toolResult.success) { this.stats.totalExecuted++ } else { this.stats.totalToolErrors++ }
@@ -1554,7 +1554,7 @@ export class ProxyGateway {
       executed: true, requestId: approval.requestId,
       outcome: toolResult.success ? 'succeeded' : 'tool_reported_failure',
       result: toolResult.result, toolError: toolResult.success ? undefined : toolResult.error,
-      proof, receipt, decision: approval.decision,
+      proof, receipt, decision: structuredClone(approval.decision),
       sao, flowCheck: flowCheckResult,
       obligationResolutions: obligationResolutions.length > 0 ? obligationResolutions : undefined,
       envelope,
@@ -1764,8 +1764,9 @@ export class ProxyGateway {
 
   getStats(): GatewayStats { return { ...this.stats } }
 
+  /** Copies of the agent's approvals; the stored approvals are not handed out. */
   getAgentApprovals(agentId: string): GatewayApproval[] {
-    return Array.from(this.approvals.values()).filter(a => a.agentId === agentId)
+    return Array.from(this.approvals.values()).filter(a => a.agentId === agentId).map(a => structuredClone(a))
   }
 
   // ── Cross-Chain + Obligation Management ──
