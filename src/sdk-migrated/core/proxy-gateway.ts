@@ -1384,6 +1384,20 @@ export class ProxyGateway {
       }
     }
 
+    // The stored decision must still verify under the gateway key, over the same
+    // preimage evaluateIntent signed.
+    const { signature: decisionSignature, ...unsignedDecision } = approval.decision
+    let decisionVerified = false
+    try { decisionVerified = verify(canonicalize(unsignedDecision), decisionSignature, this.config.gatewayPublicKey) } catch { decisionVerified = false }
+    if (!decisionVerified) {
+      this.stats.totalDenied++
+      return {
+        executed: false, requestId: approval.requestId,
+        denialReason: 'Approved decision signature does not verify',
+        decision: structuredClone(approval.decision)
+      }
+    }
+
     // Frame TTL auto-rotation (F-2 fix)
     if (this.config.enableCrossChainEnforcement && agent.executionFrame) {
       if (isFrameExpired(agent.executionFrame)) {
