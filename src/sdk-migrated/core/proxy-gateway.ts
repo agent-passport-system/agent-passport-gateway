@@ -66,7 +66,7 @@ import type {
   ExecutionEnvelope,
   ScopedReputation, AuthorityTier, TierEscalation, EvidenceClass, TierCheckContext,
   AutonomyLevel,
-  ToolCallRequest, ToolCallResult, GatewayProof,
+  ToolCallRequest, ToolCallResult as BaseToolCallResult, GatewayProof,
   GatewayApproval, ToolExecutor, GatewayConfig,
   RegisteredAgent, GatewayStats, GatewayAgentRole,
   ConstraintFacet, ConstraintFailure, ConstraintVector,
@@ -85,6 +85,15 @@ import type {
   FlowCheckResult,
   DataGateway,
 } from 'agent-passport-system'
+
+/** What is known about the effect of a dispatched call. Set only when the
+ *  gateway dispatched (executed: true). 'unknown' means the executor threw,
+ *  so it may or may not have acted before throwing. */
+export type ToolCallOutcome = 'succeeded' | 'tool_reported_failure' | 'unknown'
+
+export interface ToolCallResult extends BaseToolCallResult {
+  outcome?: ToolCallOutcome
+}
 
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -923,7 +932,7 @@ export class ProxyGateway {
     } catch (err: unknown) {
       this.stats.totalToolErrors++
       this.usedRequestIds.set(request.requestId, Date.now())
-      const result: ToolCallResult = { executed: true, requestId: request.requestId, toolError: err instanceof Error ? err.message : String(err), decision }
+      const result: ToolCallResult = { executed: true, outcome: 'unknown', requestId: request.requestId, toolError: err instanceof Error ? err.message : String(err), decision }
       this.config.onToolCall?.(request, result)
       return result
     }
@@ -1140,6 +1149,7 @@ export class ProxyGateway {
 
     const result: ToolCallResult = {
       executed: true, requestId: request.requestId,
+      outcome: toolResult.success ? 'succeeded' : 'tool_reported_failure',
       result: toolResult.result, toolError: toolResult.success ? undefined : toolResult.error,
       proof, receipt, decision,
       sao, flowCheck: flowCheckResult,
@@ -1445,7 +1455,11 @@ export class ProxyGateway {
 
     let toolResult: { success: boolean; result?: unknown; error?: string }
     try { toolResult = await this.executor(approval.tool, approval.params) }
-    catch (err: unknown) { this.stats.totalToolErrors++; return { executed: true, requestId: approval.requestId, toolError: err instanceof Error ? err.message : String(err), decision: approval.decision } }
+    catch (err: unknown) {
+      // The approval stays consumed: the call was dispatched and its effect is unknown.
+      this.stats.totalToolErrors++
+      return { executed: true, outcome: 'unknown', requestId: approval.requestId, toolError: err instanceof Error ? err.message : String(err), decision: approval.decision }
+    }
 
     if (toolResult.success) { this.stats.totalExecuted++ } else { this.stats.totalToolErrors++ }
 
@@ -1538,6 +1552,7 @@ export class ProxyGateway {
 
     return {
       executed: true, requestId: approval.requestId,
+      outcome: toolResult.success ? 'succeeded' : 'tool_reported_failure',
       result: toolResult.result, toolError: toolResult.success ? undefined : toolResult.error,
       proof, receipt, decision: approval.decision,
       sao, flowCheck: flowCheckResult,

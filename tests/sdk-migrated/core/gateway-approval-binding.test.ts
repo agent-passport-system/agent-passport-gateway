@@ -124,3 +124,57 @@ describe('ProxyGateway approval parameter binding', () => {
     assert.equal(gateway.getStats().totalDenied, deniedBefore + 1)
   })
 })
+
+describe('ProxyGateway dispatch outcome', () => {
+  it('approval path: a throwing executor yields outcome unknown, executed true, called once', async () => {
+    const { gateway, calls, makeRequest } = setup('throw')
+    const approved = gateway.approve(makeRequest(structuredClone(APPROVED)))
+    const result = await gateway.executeApproval(approved.approval!.approvalId)
+    assert.equal(result.executed, true)
+    assert.equal(result.outcome, 'unknown')
+    assert.equal(result.toolError, 'Executor crashed mid-call')
+    assert.equal(calls.length, 1)
+  })
+
+  it('approval path: after a throw the approval stays consumed and a retry is refused as replay', async () => {
+    const { gateway, calls, makeRequest, storedApproval } = setup('throw')
+    const approved = gateway.approve(makeRequest(structuredClone(APPROVED)))
+    const id = approved.approval!.approvalId
+    await gateway.executeApproval(id)
+    assert.equal(storedApproval(id).consumed, true)
+
+    const replaysBefore = gateway.getStats().replayAttemptsBlocked
+    const retry = await gateway.executeApproval(id)
+    assert.equal(retry.executed, false)
+    assert.equal(retry.denialReason, 'Approval already consumed (replay)')
+    assert.equal(gateway.getStats().replayAttemptsBlocked, replaysBefore + 1)
+    assert.equal(calls.length, 1, 'executor called exactly once')
+  })
+
+  it('approval path: tool-reported failure yields outcome tool_reported_failure', async () => {
+    const { gateway, makeRequest } = setup('error')
+    const approved = gateway.approve(makeRequest(structuredClone(APPROVED)))
+    const result = await gateway.executeApproval(approved.approval!.approvalId)
+    assert.equal(result.executed, true)
+    assert.equal(result.outcome, 'tool_reported_failure')
+    assert.equal(result.toolError, 'Tool reported failure')
+  })
+
+  it('approval path: success yields outcome succeeded', async () => {
+    const { gateway, makeRequest } = setup('success')
+    const approved = gateway.approve(makeRequest(structuredClone(APPROVED)))
+    const result = await gateway.executeApproval(approved.approval!.approvalId)
+    assert.equal(result.executed, true)
+    assert.equal(result.outcome, 'succeeded')
+  })
+
+  it('single step path: throw, tool failure and success map to distinct outcomes', async () => {
+    for (const [behavior, expected] of [['throw', 'unknown'], ['error', 'tool_reported_failure'], ['success', 'succeeded']] as const) {
+      const { gateway, calls, makeRequest } = setup(behavior)
+      const result = await gateway.processToolCall(makeRequest(structuredClone(APPROVED)))
+      assert.equal(result.executed, true, `${behavior}: ${result.denialReason}`)
+      assert.equal(result.outcome, expected, behavior)
+      assert.equal(calls.length, 1)
+    }
+  })
+})
