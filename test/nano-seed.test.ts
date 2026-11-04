@@ -79,3 +79,38 @@ describe('Nano master seed: operator pause and startup check', () => {
     }
   })
 })
+
+describe('Nano master seed: format and restore on the production path', () => {
+  it('initMasterSeed stores a 128 hex HD seed, not the 32 byte entropy, and every derivation path agrees', async () => {
+    const nanoMod: any = await import('nanocurrency-web')
+    const nano = nanoMod.default || nanoMod
+    const { NanoLocalWallet } = await import('../src/payment-rails/wallet-crypto.js')
+    const p = join(dir(), 'seed')
+    const { address } = initMasterSeed(p)
+    const seed = getMasterSeed(p)
+    // HD seed: 64 bytes as 128 hex characters, produced by wallet.generate(entropy)
+    assert.match(seed, /^[0-9a-f]{128}$/i)
+    // the stored value restores as an HD wallet
+    const restored = nano.wallet.fromSeed(seed)
+    assert.equal(restored.seed.toLowerCase(), seed.toLowerCase())
+    // production derivation (deriveAddress, NanoLocalWallet.getAddress) equals the library's
+    // HD accounts() for indexes 0 and 1, and the index 0 address printed at init
+    const lib = nano.wallet.accounts(seed, 0, 1).map((a: any) => a.address)
+    const prod = [deriveAddress(seed, 0).address, deriveAddress(seed, 1).address]
+    const svc = new NanoLocalWallet({ seedPath: p })
+    assert.deepEqual(prod, lib)
+    assert.deepEqual([svc.getAddress(0), svc.getAddress(1)], lib)
+    assert.equal(address, lib[0])
+    assert.equal(restored.accounts[0].address, lib[0])
+    // a copy of the file (a backup) restores the same addresses
+    const copy = join(dir(), 'backup')
+    writeFileSync(copy, readFileSync(p, 'utf8'))
+    assert.deepEqual([deriveAddress(getMasterSeed(copy), 0).address, deriveAddress(getMasterSeed(copy), 1).address], lib)
+  })
+
+  it('a 64 hex legacy seed is rejected rather than misread as an HD seed', () => {
+    const p = join(dir(), 'seed')
+    writeFileSync(p, 'ab'.repeat(32))
+    assert.throws(() => getMasterSeed(p), /not a 64 byte hex seed/)
+  })
+})
