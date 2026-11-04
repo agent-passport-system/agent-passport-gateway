@@ -12,6 +12,7 @@
 // @ts-ignore — nanocurrency-web has no type declarations
 import nanoWebImport from 'nanocurrency-web'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { nanoRpc } from './rpc-client.js'
 
 // Handle CJS/ESM interop — nanocurrency-web is CJS
@@ -36,8 +37,9 @@ export function getMasterSeed(seedPath?: string): string {
   if (existsSync(path)) {
     return readFileSync(path, 'utf-8').trim()
   }
-  // Generate new seed
-  const wallet = nanoWallet.generate()
+  // Generate new seed from the operating system CSPRNG. Entropy is passed
+  // explicitly so seed strength never depends on the library's default source.
+  const wallet = nanoWallet.generate(randomBytes(32).toString('hex'))
   writeFileSync(path, wallet.seed, { mode: 0o600 })
   console.log(`[NANO] New master seed generated and saved to ${path}`)
   console.log(`[NANO] BACK THIS UP IMMEDIATELY. Loss = loss of all agent funds.`)
