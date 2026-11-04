@@ -152,7 +152,9 @@ export class AgentWalletService {
       const maxIdx = db.prepare(
         `SELECT MAX(wallet_index) as mx FROM agent_wallets`
       ).get() as any
-      const walletIndex = (maxIdx?.mx ?? -1) + 1
+      // Index 0 is the gateway's own wallet (nano.ts settles from index 0), so agent
+      // wallets start at 1 and never share an account with the gateway.
+      const walletIndex = Math.max(maxIdx?.mx ?? 0, 0) + 1
 
       const seed = getMasterSeed()
       const derived = deriveAddress(seed, walletIndex)

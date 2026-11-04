@@ -32,18 +32,50 @@ function defaultSeedPath(): string {
 
 const DEFAULT_SEED_PATH = defaultSeedPath()
 
+const SEED_PATTERN = /^[0-9a-fA-F]{128}$/
+
+/** Raised when no master seed is provisioned. The gateway never creates one implicitly. */
+export class NanoSeedMissingError extends Error {
+  constructor(public readonly seedPath: string) {
+    super(
+      `Nano master seed not found at ${seedPath}. Provision the existing seed, or create a new one ` +
+      `deliberately with \`npm run nano:seed-init\`. The gateway does not generate a seed on demand, ` +
+      `because a silently created seed changes every derived address.`
+    )
+    this.name = 'NanoSeedMissingError'
+  }
+}
+
+/**
+ * Load the provisioned master seed. Fails closed: a missing or malformed seed file is an error,
+ * never a reason to generate a replacement.
+ */
 export function getMasterSeed(seedPath?: string): string {
   const path = seedPath || DEFAULT_SEED_PATH
-  if (existsSync(path)) {
-    return readFileSync(path, 'utf-8').trim()
+  if (!existsSync(path)) {
+    throw new NanoSeedMissingError(path)
   }
-  // Generate new seed from the operating system CSPRNG. Entropy is passed
-  // explicitly so seed strength never depends on the library's default source.
+  const seed = readFileSync(path, 'utf-8').trim()
+  if (!SEED_PATTERN.test(seed)) {
+    throw new Error(`Nano master seed at ${path} is not a 64 byte hex seed`)
+  }
+  return seed
+}
+
+/**
+ * Deliberate initialization step. Creates a new master seed from the operating system CSPRNG and
+ * refuses to overwrite an existing file. Entropy is passed explicitly so seed strength never
+ * depends on the library's default source. Returns the path and the public index 0 address only.
+ */
+export function initMasterSeed(seedPath?: string): { path: string; address: string } {
+  const path = seedPath || DEFAULT_SEED_PATH
   const wallet = nanoWallet.generate(randomBytes(32).toString('hex'))
-  writeFileSync(path, wallet.seed, { mode: 0o600 })
-  console.log(`[NANO] New master seed generated and saved to ${path}`)
-  console.log(`[NANO] BACK THIS UP IMMEDIATELY. Loss = loss of all agent funds.`)
-  return wallet.seed
+  if (!SEED_PATTERN.test(wallet.seed)) {
+    throw new Error('generated seed has an unexpected format')
+  }
+  // 'wx' fails if the file already exists, so an existing seed is never replaced.
+  writeFileSync(path, wallet.seed, { mode: 0o600, flag: 'wx' })
+  return { path, address: nanoWallet.accounts(wallet.seed, 0, 0)[0].address }
 }
 
 // ── Key Derivation ──

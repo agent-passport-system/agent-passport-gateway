@@ -8,6 +8,7 @@
     "copy-assets": "mkdir -p dist/gateway/regulated-action && cp src/gateway/regulated-action/*.mjs dist/gateway/regulated-action/",
     "start": "node dist/server.js",
     "dev": "npx tsx src/server.ts",
+    "nano:seed-init": "npx tsx scripts/nano-seed-init.ts",
     "test": "npx tsx --test test/*.test.ts test/**/*.test.ts tests/sdk-migrated/*.test.ts tests/sdk-migrated/**/*.test.ts"
   },
   "keywords": [],
