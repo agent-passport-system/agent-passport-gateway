@@ -46,11 +46,38 @@ export class NanoSeedMissingError extends Error {
   }
 }
 
+/** Raised while an operator has paused the Nano wallets, for example during a seed rotation. */
+export class NanoWalletsPausedError extends Error {
+  constructor() {
+    super('Nano wallets are paused by the operator (NANO_WALLETS_PAUSED=1). Try again later.')
+    this.name = 'NanoWalletsPausedError'
+  }
+}
+
+function walletsPaused(): boolean {
+  return process.env.NANO_WALLETS_PAUSED === '1'
+}
+
+/**
+ * Startup check for production. Throws when the Nano wallets are in use and the seed file is
+ * missing or malformed. Skipped when the operator has disabled the rail (NANO_RAIL_DISABLED=1)
+ * or paused the wallets (NANO_WALLETS_PAUSED=1).
+ */
+export function assertNanoSeedProvisioned(seedPath?: string): void {
+  if (process.env.NANO_RAIL_DISABLED === '1' || walletsPaused()) return
+  const path = seedPath || DEFAULT_SEED_PATH
+  if (!existsSync(path)) throw new NanoSeedMissingError(path)
+  if (!SEED_PATTERN.test(readFileSync(path, 'utf-8').trim())) {
+    throw new Error(`Nano master seed at ${path} is not a 64 byte hex seed`)
+  }
+}
+
 /**
  * Load the provisioned master seed. Fails closed: a missing or malformed seed file is an error,
  * never a reason to generate a replacement.
  */
 export function getMasterSeed(seedPath?: string): string {
+  if (walletsPaused()) throw new NanoWalletsPausedError()
   const path = seedPath || DEFAULT_SEED_PATH
   if (!existsSync(path)) {
     throw new NanoSeedMissingError(path)

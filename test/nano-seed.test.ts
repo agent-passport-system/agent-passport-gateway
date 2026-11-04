@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, statSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getMasterSeed, initMasterSeed, NanoSeedMissingError, deriveAddress } from '../src/payment-rails/wallet-crypto.js'
+import { getMasterSeed, initMasterSeed, NanoSeedMissingError, NanoWalletsPausedError, assertNanoSeedProvisioned, deriveAddress } from '../src/payment-rails/wallet-crypto.js'
 
 const dir = () => mkdtempSync(join(tmpdir(), 'nano-seed-'))
 
@@ -44,5 +44,38 @@ describe('Nano master seed: fail closed', () => {
     const a = join(dir(), 'seed'), b = join(dir(), 'seed')
     initMasterSeed(a); initMasterSeed(b)
     assert.notEqual(readFileSync(a, 'utf8'), readFileSync(b, 'utf8'))
+  })
+})
+
+describe('Nano master seed: operator pause and startup check', () => {
+  it('getMasterSeed refuses while NANO_WALLETS_PAUSED=1, even with a valid seed', () => {
+    const p = join(dir(), 'seed')
+    initMasterSeed(p)
+    process.env.NANO_WALLETS_PAUSED = '1'
+    try {
+      assert.throws(() => getMasterSeed(p), NanoWalletsPausedError)
+    } finally {
+      delete process.env.NANO_WALLETS_PAUSED
+    }
+    assert.match(getMasterSeed(p), /^[0-9a-f]{128}$/i)
+  })
+
+  it('assertNanoSeedProvisioned throws for a missing seed and passes for a valid one', () => {
+    const p = join(dir(), 'seed')
+    assert.throws(() => assertNanoSeedProvisioned(p), NanoSeedMissingError)
+    initMasterSeed(p)
+    assert.doesNotThrow(() => assertNanoSeedProvisioned(p))
+  })
+
+  it('assertNanoSeedProvisioned is skipped when the rail is disabled or paused', () => {
+    const p = join(dir(), 'missing')
+    for (const flag of ['NANO_RAIL_DISABLED', 'NANO_WALLETS_PAUSED']) {
+      process.env[flag] = '1'
+      try {
+        assert.doesNotThrow(() => assertNanoSeedProvisioned(p))
+      } finally {
+        delete process.env[flag]
+      }
+    }
   })
 })

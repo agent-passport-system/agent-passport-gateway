@@ -67,6 +67,7 @@ import { initLineageTables } from './gateway/lineage.js'
 import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/identity.js'
 import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
+import { assertNanoSeedProvisioned } from './payment-rails/wallet-crypto.js'
 import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
 import { finopsRouter } from './gateway/finops.js'
 import { CONFORMANCE_SUMMARY, conformanceBadge } from './gateway/conformance-summary.js'
@@ -1816,6 +1817,18 @@ console.log(`
   Endpoints: 40 API routes + 2 public (.well-known)
 ═══════════════════════════════════════
 `)
+// Fail closed in production when the Nano wallets are in use but no seed is provisioned.
+// A silently created seed would change every derived address.
+if (process.env.NODE_ENV === 'production') {
+  try {
+    assertNanoSeedProvisioned()
+  } catch (e: any) {
+    console.error(`[NANO] FATAL: ${e.message}`)
+    console.error('[NANO] Provision the seed, or set NANO_RAIL_DISABLED=1 or NANO_WALLETS_PAUSED=1 deliberately.')
+    process.exit(1)
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`  ✅ Listening on http://localhost:${PORT}`)
   console.log(`  Health: http://localhost:${PORT}/healthz`)
