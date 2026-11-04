@@ -8,6 +8,8 @@
     "copy-assets": "mkdir -p dist/gateway/regulated-action && cp src/gateway/regulated-action/*.mjs dist/gateway/regulated-action/",
     "start": "node dist/server.js",
     "dev": "npx tsx src/server.ts",
+    "nano:seed-init": "npx tsx scripts/nano-seed-init.ts",
+    "nano:seed-addresses": "npx tsx scripts/nano-seed-addresses.ts",
     "test": "npx tsx --test test/*.test.ts test/**/*.test.ts tests/sdk-migrated/*.test.ts tests/sdk-migrated/**/*.test.ts"
   },
   "keywords": [],
@@ -24,7 +26,7 @@
     "express": "^5.2.1",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
-    "nanocurrency-web": "^1.4.3",
+    "nanocurrency-web": "^2.0.0",
     "pdfkit": "^0.18.0",
     "rate-limiter-flexible": "^10.0.1",
     "stripe": "^20.4.1",
