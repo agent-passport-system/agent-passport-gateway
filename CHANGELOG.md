@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2 (2026-11-04)
+
+**Security: Nano master seed generation (GHSA-x746-727g-7gxp).** Before this release, when the Nano payment rail had no seed file, `getMasterSeed()` created one from a random source built on `Math.random`. A seed created that way may be predictable. Updating does not repair an existing seed: if your gateway created its own seed, follow the steps in the advisory to replace it.
+
+- The gateway no longer creates a seed implicitly. A missing or malformed seed file is an error, and in production the server refuses to start while the Nano wallets are in use without a seed. A new seed comes only from `npm run nano:seed-init`, which uses `crypto.randomBytes`.
+- `NANO_WALLETS_PAUSED=1` pauses every wallet operation, for example while a seed is rotated. `npm run nano:seed-addresses` prints the addresses a seed file derives, to check a backup.
+- Agent wallets start at index 1. The first agent wallet used to share index 0 with the gateway's settlement wallet.
+- nanocurrency-web 2.0.0 (no crypto-js), body-parser 2.4.0, proxy-addr 2.0.8.
+
 ## 0.4.1 (2026-10-05)
 
 **BREAKING: scoped approvals refuse fields they cannot bind.** `POST /api/v1/approvals`,
