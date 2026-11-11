@@ -5,6 +5,7 @@
  */
 
 import Database from 'better-sqlite3'
+import { runChainSpendUpgradeHold } from '../gateway/chain-spend.js'
 import { randomUUID } from 'node:crypto'
 
 let db: Database.Database
@@ -762,6 +763,9 @@ function createTables() {
   // the server calls app.listen() (server.ts), so it completes before any traffic is accepted.
   try { db.exec(`ALTER TABLE agents ADD COLUMN is_root INTEGER NOT NULL DEFAULT 0`) } catch {}
   runIsRootOriginBackfill(db)
+  // 0.4.3: hold spending under chains whose counters predate ancestor accounting
+  // (src/gateway/chain-spend.ts). Runs before the server accepts traffic.
+  runChainSpendUpgradeHold(db)
 
   // Audit item 5 (HIGH replay): durable capability-token nullifier set. A consumed token preimage
   // must survive restarts and be shared across processes; the reference MCP store is per-process.

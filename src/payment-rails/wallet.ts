@@ -59,7 +59,10 @@ export interface WalletTransaction {
 import { xnoToRaw, rawToXno } from './nano.js'
 import { getDB } from '../db/schema.js'
 import { toCents } from '../billing/money.js'
-import { NanoLocalWallet, getLocalWallet, deriveAddress, getMasterSeed } from './wallet-crypto.js'
+import { NanoLocalWallet, NanoSendNotBroadcastError, getLocalWallet, deriveAddress, getMasterSeed } from './wallet-crypto.js'
+import { checkBoundAuthorityChain } from '../gateway/enforce.js'
+import { applyChainSpend, ancestorSpendViolation, boundChainSpendRows, chainSpendHold } from '../gateway/chain-spend.js'
+import type { ChainSpendRow } from '../gateway/chain-spend.js'
 
 // Dynamic import for SDK scope matching (ESM)
 let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
@@ -235,6 +238,20 @@ export class AgentWalletService {
     const amountRaw = xnoToRaw(String(opts.amountXno))
     const txId = randomUUID()
 
+    // 0.4.3: Nano sends are off unless the operator opts in. Delegation spend limits are
+    // created in USD and this route debits XNO against the same counter, so a limit does
+    // not mean the same amount here. Until budgets carry their own unit, sending needs
+    // NANO_WALLET_SEND_ENABLED=1 and an operator who has accepted that.
+    // The operator pause wins over the enable flag.
+    if (process.env.NANO_WALLETS_PAUSED === '1') {
+      return this.recordDenied(txId, opts, amountRaw,
+        'Nano wallets are paused by the operator (NANO_WALLETS_PAUSED=1).')
+    }
+    if (process.env.NANO_WALLET_SEND_ENABLED !== '1') {
+      return this.recordDenied(txId, opts, amountRaw,
+        'Nano wallet send is disabled by default: delegation limits are in USD and this route debits XNO. Set NANO_WALLET_SEND_ENABLED=1 to enable it.')
+    }
+
     // ── Gate 1: Wallet exists and is active ──
     const wallet = db.prepare(
       `SELECT * FROM agent_wallets WHERE tenant_id = ? AND agent_id = ? AND status = 'active'`
@@ -264,26 +281,39 @@ export class AgentWalletService {
         `Agent lacks commerce:send scope. Has: [${delegation.scope}]`)
     }
 
+    // ── Gate 2b (Day 268): the delegation's whole bound chain must still be authoritative ──
+    // A revoked, suspended or frozen grantor anywhere up the chain ends this send, the same
+    // rule /evaluate applies.
+    const chainCheck = checkBoundAuthorityChain(db, opts.tenantId, delegation.id)
+    if (!chainCheck.ok) {
+      return this.recordDenied(txId, opts, amountRaw,
+        `Delegation authority chain is invalid (code=${chainCheck.code}, hop=${chainCheck.hop})`)
+    }
     // ── Gate 3: Atomic spend limit check + optimistic debit (C3: prevents TOCTOU) ──
+    // Day 268: the send must also fit every bounded ancestor on the delegation's bound chain,
+    // and is debited on every row of that chain (see gateway/chain-spend.ts). The rows are kept
+    // here so a failed on-chain send reverses the same rows.
+    let chainRows: ChainSpendRow[] | null = null
     const spendCheckPassed = db.transaction(() => {
       const freshDel = db.prepare(`SELECT spend_limit, spend_used FROM delegations WHERE id = ? AND tenant_id = ?`).get(delegation.id, opts.tenantId) as any
-      if (freshDel?.spend_limit) {
+      // Day 268: `!= null`, not truthiness. A spend_limit of 0 is a zero budget, not no limit.
+      if (freshDel && freshDel.spend_limit != null) {
         const remaining = Math.round((freshDel.spend_limit - (freshDel.spend_used || 0)) * 1e6) / 1e6
         const amount = Math.round(opts.amountXno * 1e6) / 1e6
         if (amount > remaining) return false
       }
+      const rows = boundChainSpendRows(db, opts.tenantId, delegation.id)
+      if (!rows) return false
+      if (chainSpendHold(db, rows)) return false
+      if (ancestorSpendViolation(rows, opts.amountXno, n => Math.round(n * 1e6) / 1e6)) return false
+      chainRows = rows
       // C4 dual-write: mirror to spend_used_cents. Note: this column treats
       // spend_used uniformly across rails — same convention as the REAL
       // column already does (i.e. XNO and USD both accumulate here). The
       // unit-confusion concern is pre-existing and will be addressed when
       // we introduce a per-rail spend_used column in Phase B.
       const incCents = toCents(opts.amountXno) || 0
-      db.prepare(
-        `UPDATE delegations
-         SET spend_used = spend_used + ?,
-             spend_used_cents = COALESCE(spend_used_cents, 0) + ?
-         WHERE id = ?`
-      ).run(opts.amountXno, incCents, delegation.id)
+      applyChainSpend(db, rows, opts.amountXno, incCents)
       return true
     }).immediate()
 
@@ -337,15 +367,34 @@ export class AgentWalletService {
       return tx
 
     } catch (e: any) {
-      // Reverse the optimistic debit since on-chain send failed.
+      if (!(e instanceof NanoSendNotBroadcastError)) {
+        // Day 268: the error came during or after publishing, so the block may still be
+        // accepted. The debit stays on every chain row and the transaction is recorded as
+        // pending with the reason, for reconciliation. Releasing the budget here could let
+        // a second send go out while the first one settles.
+        db.prepare(`INSERT INTO wallet_transactions
+          (id, tenant_id, from_agent_id, to_address, amount_raw, amount_xno,
+           delegation_id, scope_used, status, denial_reason)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+          .run(txId, opts.tenantId, opts.fromAgentId, opts.toAddress,
+            amountRaw, String(opts.amountXno), delegation.id,
+            'commerce:send', `outcome_unknown: ${e?.message ?? String(e)}`)
+        try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'pending' } }) } catch {}
+        return {
+          id: txId, tenant_id: opts.tenantId,
+          from_agent_id: opts.fromAgentId,
+          to_address: opts.toAddress,
+          amount_raw: amountRaw, amount_xno: String(opts.amountXno),
+          status: 'pending' as const, denial_reason: `outcome_unknown: ${e?.message ?? String(e)}`,
+          created_at: new Date().toISOString(),
+        }
+      }
+      // Nothing was published: reverse the optimistic debit on every chain row.
       // C4 dual-write: keep both columns in sync on the rollback.
       const reverseCents = toCents(opts.amountXno) || 0
-      db.prepare(
-        `UPDATE delegations
-         SET spend_used = spend_used - ?,
-             spend_used_cents = COALESCE(spend_used_cents, 0) - ?
-         WHERE id = ?`
-      ).run(opts.amountXno, reverseCents, delegation.id)
+      // chainRows is always set here: this path runs only after the transaction above
+      // debited it. Without rows there is nothing this send debited, so nothing to reverse.
+      if (chainRows) applyChainSpend(db, chainRows, -opts.amountXno, -reverseCents)
 
       db.prepare(`INSERT INTO wallet_transactions
         (id, tenant_id, from_agent_id, to_address, amount_raw, amount_xno,

@@ -198,6 +198,17 @@ async function publishBlock(rpcUrl: string, block: any): Promise<string> {
 // Send Nano — local signing, remote work + publish
 // ══════════════════════════════════════════════════════
 
+/** Day 268: a send that failed before the block was handed to the network. Nothing was
+ *  published, so the caller may release what it reserved for this send. Any other error
+ *  from sendNano happened during or after publishing, and the caller must treat the
+ *  outcome as unknown: the block may still be accepted. */
+export class NanoSendNotBroadcastError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'NanoSendNotBroadcastError'
+  }
+}
+
 export async function sendNano(opts: {
   rpcUrl: string
   seed: string
@@ -205,32 +216,41 @@ export async function sendNano(opts: {
   toAddress: string
   amountRaw: string
 }): Promise<{ blockHash: string; fromAddress: string }> {
-  const account = deriveAccount(opts.seed, opts.fromIndex)
-  const info = await getAccountInfo(opts.rpcUrl, account.address)
-  if (!info.open) throw new Error(`Account ${account.address} has not been opened (no balance)`)
+  let account: ReturnType<typeof deriveAccount>
+  let info: Awaited<ReturnType<typeof getAccountInfo>>
+  let newBalance: string
+  let work: string
+  let sendBlock: ReturnType<typeof nanoBlock.send>
+  try {
+    account = deriveAccount(opts.seed, opts.fromIndex)
+    info = await getAccountInfo(opts.rpcUrl, account.address)
+    if (!info.open) throw new Error(`Account ${account.address} has not been opened (no balance)`)
 
-  const currentBalance = BigInt(info.balance)
-  const sendAmount = BigInt(opts.amountRaw)
-  if (sendAmount > currentBalance) {
-    throw new Error(`Insufficient balance: have ${info.balance} raw, need ${opts.amountRaw} raw`)
+    const currentBalance = BigInt(info.balance)
+    const sendAmount = BigInt(opts.amountRaw)
+    if (sendAmount > currentBalance) {
+      throw new Error(`Insufficient balance: have ${info.balance} raw, need ${opts.amountRaw} raw`)
+    }
+    newBalance = (currentBalance - sendAmount).toString()
+
+    // Generate work on the frontier
+    work = await generateWork(opts.rpcUrl, info.frontier)
+
+    // Build and sign block locally
+    sendBlock = nanoBlock.send({
+      walletBalanceRaw: info.balance,
+      fromAddress: account.address,
+      toAddress: opts.toAddress,
+      representativeAddress: info.representative || DEFAULT_REP,
+      frontier: info.frontier,
+      amountRaw: opts.amountRaw,
+      work,
+    }, account.privateKey)
+  } catch (e: any) {
+    throw new NanoSendNotBroadcastError(e?.message ?? String(e))
   }
-  const newBalance = (currentBalance - sendAmount).toString()
 
-  // Generate work on the frontier
-  const work = await generateWork(opts.rpcUrl, info.frontier)
-
-  // Build and sign block locally
-  const sendBlock = nanoBlock.send({
-    walletBalanceRaw: info.balance,
-    fromAddress: account.address,
-    toAddress: opts.toAddress,
-    representativeAddress: info.representative || DEFAULT_REP,
-    frontier: info.frontier,
-    amountRaw: opts.amountRaw,
-    work,
-  }, account.privateKey)
-
-  // Publish to network
+  // Publish to network. From here an error does not mean nothing was sent.
   const blockHash = await publishBlock(opts.rpcUrl, {
     account: account.address,
     previous: info.frontier,

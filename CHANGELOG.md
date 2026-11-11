@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.3 (unreleased)
+
+**Security: a delegation's budget did not cover spending below it (GHSA-w2v3-jgwx-8xjf).** In every earlier version, `POST /api/v1/evaluate` and `POST /api/v1/wallets/send` checked and debited only the acting agent's own delegation. Spending under a child delegation did not count against its parent's budget, so a grant that was split into sub-delegations could authorize more in total than the grant allowed.
+
+- A spend now has to fit every bounded delegation on the acting delegation's chain, and a permit debits every delegation on that chain in the same transaction.
+- `POST /api/v1/wallets/send` now checks the whole delegation chain for a revoked, suspended or frozen grantor, as `/evaluate` already did, and treats a `spend_limit` of 0 as a zero budget. Before, it read 0 as no limit.
+- A Nano send that fails before its block is published releases its debit. A send that fails while or after publishing keeps the debit and is recorded as `pending` with the reason `outcome_unknown`, because the block may still be accepted.
+
+**BREAKING: Nano wallet send is off by default.** Delegation spend limits are created in USD, and `POST /api/v1/wallets/send` debits XNO against the same counter, so a limit does not mean the same amount on that route. Sends are refused unless `NANO_WALLET_SEND_ENABLED=1` is set, and `NANO_WALLETS_PAUSED=1` still refuses them when it is. Leave the flag unset until budgets carry their own unit.
+
+**Upgrading an existing installation.** Earlier versions recorded a child's spending without adding it to its ancestors' counters, and updating the code does not repair those values. On its first start, 0.4.3 holds every delegation whose counter cannot be trusted and refuses spending through it, even where no budget was exceeded:
+
+- every ancestor of a delegation that had spent, through `parent_delegation_id`
+- every sub-delegation from before 0.4.1, which has no `parent_delegation_id`, together with its grantor's inbound delegation and that delegation's ancestors
+
+The holds are listed in the `chain_spend_holds` table, with each delegation's direct `spend_used` at upgrade time. To release a chain, either revoke it and grant new delegations, or reconcile each ancestor's counter from the direct spending of its whole subtree and then delete its hold rows. Delete a hold row only after that reconciliation or revocation is complete. Keep the record of any spending that exceeded a limit. Do not cap a counter to make it fit. A new database gets no holds.
+
+**Do not downgrade a database upgraded to 0.4.3 to an earlier gateway version.** Earlier versions do not enforce the spending holds and restore the ancestor budget vulnerability.
+
+**Remaining limitations, not changed by this release.** `/evaluate` accepts the cost the caller reports, so its budget accounting is only as accurate as those values, and it does not establish what an executed action cost. Nano wallet sending needs budgets that carry their own unit and a pending record written before a block is broadcast before it should be enabled.
+
 ## 0.4.2 (2026-11-04)
 
 **Security: Nano master seed generation (GHSA-x746-727g-7gxp).** Before this release, when the Nano payment rail had no seed file, `getMasterSeed()` created one from a random source built on `Math.random`. A seed created that way may be predictable. Updating does not repair an existing seed: if your gateway created its own seed, follow the steps in the advisory to replace it.
