@@ -48,6 +48,8 @@ import { emitToEventSpine } from './simulation/event-spine.js'
 const spendAlertsSent = new Set<string>()
 import { checkAgentLimit, checkEvaluationLimit } from '../billing/limits.js'
 import { toCents } from '../billing/money.js'
+import { applyChainSpend, ancestorSpendViolation, boundChainSpendRows, chainSpendHold } from './chain-spend.js'
+import type { ChainSpendRow } from './chain-spend.js'
 
 function safeError(e: any, context: string): { error: string; ref: string } {
   const ref = randomUUID().slice(0, 8)
@@ -674,6 +676,7 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
 
     let verdict = 'permit'
     const violations: string[] = []
+    let chainRows: ChainSpendRow[] | null = null
 
     // G-B3: fold the freshness-tier outcome into the verdict. A blocking
     // outcome (tier 3 fail-closed, tier 2 deny-if-stale, tier 1
@@ -725,6 +728,25 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
           violations.push(`Cost $${estimated_cost} exceeds remaining budget $${remaining.toFixed(2)}`)
         }
       }
+      // Day 268: the cost must also fit every bounded ANCESTOR on the bound chain, because a
+      // delegation's budget covers everything spent beneath it. See chain-spend.ts.
+      if (estimated_cost && estimated_cost > 0 && isNonNegativeFiniteCost(estimated_cost)) {
+        chainRows = boundChainSpendRows(db, tenant.id, delegation.id)
+        if (!chainRows) {
+          verdict = 'deny'
+          violations.push('Delegation chain budget could not be read')
+        } else if (chainSpendHold(db, chainRows)) {
+          const h = chainSpendHold(db, chainRows)!
+          verdict = 'deny'
+          violations.push(`Delegation chain spending is on hold since the 0.4.3 upgrade (${h.reason}, delegation ${h.delegation_id}): its counters predate ancestor accounting. Reconcile or re-grant the chain.`)
+        } else {
+          const over = ancestorSpendViolation(chainRows, estimated_cost)
+          if (over) {
+            verdict = 'deny'
+            violations.push(`Cost $${estimated_cost} exceeds remaining budget $${over.remaining.toFixed(2)} of an ancestor delegation (hop ${over.hop})`)
+          }
+        }
+      }
     }
 
     // Agent type enforcement
@@ -756,12 +778,12 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       // C4 dual-write: REAL column (existing) + INTEGER cents (forward-compat).
       // COALESCE guards against rows that pre-date the cents column.
       const inc_cents = toCents(estimated_cost) || 0
-      db.prepare(
-        `UPDATE delegations
-         SET spend_used = spend_used + ?,
-             spend_used_cents = COALESCE(spend_used_cents, 0) + ?
-         WHERE id = ?`
-      ).run(estimated_cost, inc_cents, delegation.id)
+      // Day 268: debit the acting row and every ancestor on its bound chain (chain-spend.ts).
+      // A permit with a positive cost always has chain rows: the ancestor check above either
+      // read them or denied. If that ever stops holding, throwing here rolls back the whole
+      // transaction rather than debiting a chain nobody checked.
+      if (!chainRows) throw new Error('chain spend rows missing at debit: refusing to debit an unchecked chain')
+      applyChainSpend(db, chainRows, estimated_cost, inc_cents)
     }
 
     return { verdict, reason, violations, durationMs, delegation }
@@ -3341,7 +3363,7 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
       ],
       gateway: {
         id: 'gateway.aeoess.com',
-        version: '0.4.2',
+        version: '0.4.3',
         kid: 'gateway-v1',
         jwks: 'https://gateway.aeoess.com/.well-known/jwks.json',
       },
