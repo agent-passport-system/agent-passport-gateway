@@ -3404,7 +3404,7 @@ gatewayRouter.get('/governance/export', (req: any, res) => {
       ],
       gateway: {
         id: 'gateway.aeoess.com',
-        version: '0.4.3',
+        version: '0.5.0',
         kid: 'gateway-v1',
         jwks: 'https://gateway.aeoess.com/.well-known/jwks.json',
       },

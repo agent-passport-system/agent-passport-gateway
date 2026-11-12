@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-11-11)
 
 **BREAKING: Nano publishing is disabled.** Agent wallet sends, receives and settlement payouts now refuse to publish, even when their feature switches are enabled. These paths stop before deriving a private key or contacting a Nano node. If a send has already debited a delegation budget, the debit is reversed and the attempt is recorded as failed.
 
