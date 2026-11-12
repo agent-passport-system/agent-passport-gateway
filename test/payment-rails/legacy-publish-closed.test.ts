@@ -1,9 +1,11 @@
 // Copyright 2024-2026 Tymofii Pidlisnyi. Apache-2.0 license. See LICENSE.
 // ══════════════════════════════════════════════════════════════════
-// The legacy Nano publish path is closed in this release. This release writes no durable payment
-// record before a block is broadcast, so a crash or timeout while publishing could leave a send the
-// gateway cannot reconcile. Agent sends, receives and settlement payouts all refuse before deriving
-// a key or calling a node, whatever the switches say, and the source has no Nano process call.
+// The legacy Nano publish path is closed. It wrote no durable payment record before a block was
+// broadcast, so a crash or timeout while publishing could leave a send the gateway cannot
+// reconcile. Legacy sends, receives and settlement payouts all refuse before deriving a key or
+// calling a node, whatever the switches say, and the legacy files have no Nano process call. The
+// one process call in the source is the lifecycle's, in nano-publish.ts (nano-publish.test.ts B3),
+// and the server does not install the lifecycle in this release (nano-activation-closed.test.ts).
 // ══════════════════════════════════════════════════════════════════
 import { describe, it, before, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
@@ -93,7 +95,7 @@ describe('the legacy publish path is closed', () => {
     assert.equal(out.fetches, 0)
   })
 
-  it('the source has no Nano process call', () => {
+  it('the only Nano process call in the source is the lifecycle one in nano-publish.ts', () => {
     const hits: string[] = []
     const walk = (dir: string) => {
       for (const name of readdirSync(dir)) {
@@ -105,6 +107,7 @@ describe('the legacy publish path is closed', () => {
       }
     }
     walk('src')
-    assert.deepEqual(hits, [])
+    assert.equal(hits.length, 1)
+    assert.match(hits[0], /payment-rails[\\/]nano-publish\.ts:/)
   })
 })

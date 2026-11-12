@@ -67,8 +67,12 @@ import { initLineageTables } from './gateway/lineage.js'
 import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/identity.js'
 import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
-import { assertNanoSeedProvisioned } from './payment-rails/wallet-crypto.js'
+import { assertNanoSeedProvisioned, DEFAULT_REP } from './payment-rails/wallet-crypto.js'
 import { computeDelegationChainHash } from './gateway/delegation-chain-hash.js'
+import { startNanoLifecycle, lifecycleHealth, seedSigner, gatewayAddressOrNull, type LifecycleHandle } from './payment-rails/nano-lifecycle-startup.js'
+import { rpcNode } from './payment-rails/nano-publish.js'
+import { NANO_LIFECYCLE_ACTIVATED } from './payment-rails/nano-activation.js'
+import { newOwnerId } from './payment-rails/wallet-reconcile.js'
 import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
 import { finopsRouter } from './gateway/finops.js'
 import { CONFORMANCE_SUMMARY, conformanceBadge } from './gateway/conformance-summary.js'
@@ -172,6 +176,15 @@ app.get('/index.html', (_req, res) => res.redirect(301, `${APP_ORIGIN}/portal.ht
 // Health check (no auth)
 app.get('/healthz', (_req, res) => {
   res.json({ status: 'ok', service: 'aeoess-gateway', version: '0.5.0' })
+})
+
+// Day 268: the Nano lifecycle's own readiness. 503 until the first recovery pass finishes, and
+// whenever a pass failed, hit an integrity fault or found an unsafe wallet mapping. /healthz above
+// stays 200 on purpose (see nano-lifecycle-startup.ts).
+let nanoLifecycle: LifecycleHandle | null = null
+app.get('/healthz/nano-lifecycle', (_req, res) => {
+  const h = lifecycleHealth(nanoLifecycle)
+  res.status(h.code).json(h.body)
 })
 
 app.get('/health', (_req, res) => {
@@ -1781,6 +1794,25 @@ if (process.env.NODE_ENV === 'production') {
     console.error('[NANO] Provision the seed, or set NANO_RAIL_DISABLED=1 or NANO_WALLETS_PAUSED=1 deliberately.')
     process.exit(1)
   }
+}
+
+// Day 268: install the Nano lifecycle runner and recover unfinished operations. Runs whether or
+// not Nano is paused: paused recovery reads the node and publishes nothing. NANO_RAIL_DISABLED=1
+// turns it off entirely.
+// Not activated in this release: NANO_LIFECYCLE_ACTIVATED is false in source, so the runner is
+// never installed here and every send is refused with nothing reserved (see nano-activation.ts).
+if (NANO_LIFECYCLE_ACTIVATED && process.env.NANO_RAIL_DISABLED !== '1') {
+  const rpcUrl = process.env.NANO_RPC_URL || 'https://rpc.nano.to'
+  nanoLifecycle = startNanoLifecycle(db, {
+    ctx: {
+      node: rpcNode(rpcUrl), owner: newOwnerId(), leaseMs: 60_000, now: Date.now,
+      signer: seedSigner(db), openRepresentative: DEFAULT_REP,
+      reconcile: { source: rpcUrl }, rebroadcastMs: 60_000,
+    },
+    tickMs: Number(process.env.NANO_LIFECYCLE_TICK_MS) || 30_000,
+    gatewayAddress: gatewayAddressOrNull(),
+    finalWatchMs: Number(process.env.NANO_FINAL_WATCH_MS) || undefined,
+  })
 }
 
 app.listen(PORT, () => {

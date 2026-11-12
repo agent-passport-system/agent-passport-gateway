@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+**Nano payment lifecycle, not activated.** The source now contains a payment lifecycle for agent wallet sends. Each send is a durable operation that reserves budget on every delegation in its chain, signs one block and publishes it through a single call site. It counts as spent when the configured node reports that the operation's own block is confirmed, or when an operator resolves a conflict incident that way with evidence the operator supplies.
+
+The server in this release does not activate it. `NANO_LIFECYCLE_ACTIVATED` in `src/payment-rails/nano-activation.ts` is false in source and is not read from the environment, so the server never installs the lifecycle runner. After authentication and the `Idempotency-Key` header check, `POST /api/v1/wallets/send` refuses every request with nothing reserved: 403 while the operator send switch is off or the pause is on, 503 otherwise. `GET /healthz/nano-lifecycle` reports `disabled`. The legacy publish paths stay closed. No environment or runtime configuration makes the server publish a Nano block. The lifecycle code itself can be run by the tests and by a standalone harness with a fake node, which is the point of shipping it.
+
+What the lifecycle code does when a test or harness runs it:
+
+- `POST /api/v1/wallets/send` requires an `Idempotency-Key` header. One key is one payment, and a retry returns the same operation. The answer is 202 with the operation, and `GET /api/v1/wallets/ops/:id` reports its state.
+- A send is built only on an account state an operator recorded for that wallet. If the node reports a different frontier or balance, the send waits and nothing is signed.
+- A payment that may have been published never releases its reservation automatically. A payment cancelled before any publish attempt releases its reservation.
+- A different block on the same previous that carries a valid signature of the account is an incident. The wallet is frozen, the delegation chain is held, new sends stop, and only an operator resolution that matches the recorded incident ends it. A reported block that does not verify is a node fault and freezes nothing.
+- Pilot caps (`NANO_PILOT_MAX_PAYMENT_RAW`, `NANO_PILOT_MAX_WALLET_RAW`, `NANO_PILOT_MAX_PAYMENTS`) must all be set, or every send is refused.
+
+Known limits, stated on purpose:
+
+- A confirmation is taken from the one configured node. If that node reports a false confirmation, the gateway can count the payment as spent, report it confirmed to the caller and stop publishing its block even when the recipient was not paid. The signed block still exists and the network can accept it if someone broadcasts it later. Later sends from that wallet stop until an operator acts.
+- A reservation is never released by time. If a block is dropped or the node is unreachable, the amount stays held on every delegation in the chain until the block confirms or an operator resolves it.
+- One faulty node stops new sends for every tenant.
+- An operator resolution is checked against what the gateway recorded, but the gateway does not contact or authenticate the outside sources the operator names.
+- None of this has had an independent security review.
+
+**Upgrading.** Startup creates `wallet_ops`, `wallet_op_reservations`, `wallet_op_attempts` and `wallet_frontiers`, although the lifecycle is off. The refusal text for a send while `NANO_WALLET_SEND_ENABLED` is unset no longer says budgets are in USD. A new dependency, `@noble/hashes`, is pinned at 1.8.0.
+
 ## 0.5.0 (2026-11-11)
 
 **BREAKING: Nano publishing is disabled.** Agent wallet sends, receives and settlement payouts now refuse to publish, even when their feature switches are enabled. These paths stop before deriving a private key or contacting a Nano node. If a send has already debited a delegation budget, the debit is reversed and the attempt is recorded as failed.

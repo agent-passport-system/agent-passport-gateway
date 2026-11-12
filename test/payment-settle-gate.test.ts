@@ -111,11 +111,13 @@ before(async () => {
 
 after(async () => {
   delete process.env.SETTLE_PAYOUT_ENABLED
+  delete process.env.NANO_WALLET_SEND_ENABLED
+  delete process.env.NANO_WALLETS_PAUSED
   await new Promise<void>((resolve) => server.close(() => resolve()))
 })
 
 describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate', () => {
-  it('every switch on and the real rail: the payout route publishes nothing and records no confirmed payout', async () => {
+  it('Day 268: every switch on and the real rail: the legacy payout path still publishes nothing', async () => {
     const realFetch = globalThis.fetch
     let fetches = 0
     process.env.SETTLE_PAYOUT_ENABLED = 'true'
@@ -128,11 +130,15 @@ describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate'
         fetches++
         throw new Error('no network in tests')
       }) as any
-      const { status, body } = await settle({ 'src-xno': 'nano_1xno' })
+      const res = await fetch(`${baseUrl}/api/v1/pay/nano/settle/${SETTLEMENT_ID}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ destination_map: { 'src-xno': 'nano_1xno' } }),
+      })
+      const body = await res.json() as any
       const xno = body.results?.find((x: any) => x.source_id === 'src-xno')
-      assert.equal(status, 200)
+      assert.equal(res.status, 200)
       assert.equal(xno?.status, 'failed')
-      assert.match(String(xno?.error), /settlement payouts are closed/)
+      assert.match(String(xno?.error), /settlement payouts are not on the Nano lifecycle/)
       assert.equal(fetches, 0)
       const confirmed = getDB().prepare(`SELECT COUNT(*) AS c FROM payment_transactions WHERE settlement_id = ? AND status = 'confirmed'`).get(SETTLEMENT_ID) as any
       assert.equal(confirmed.c, 0)
@@ -140,6 +146,26 @@ describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate'
       globalThis.fetch = realFetch
       delete process.env.SETTLE_PAYOUT_ENABLED
       delete process.env.NANO_WALLET_SEND_ENABLED
+    }
+  })
+
+  it('Day 268: payouts enabled but Nano paused or sends not enabled: 503 and nothing sent', async (t) => {
+    process.env.SETTLE_PAYOUT_ENABLED = 'true'
+    const send = t.mock.method(rail, 'sendPayment', async () => fakeConfirmation())
+    try {
+      delete process.env.NANO_WALLET_SEND_ENABLED
+      const off = await settle({ 'src-xno': 'nano_1xno' })
+      assert.equal(off.status, 503)
+      assert.equal(off.body.error, 'nano_send_not_enabled')
+      process.env.NANO_WALLET_SEND_ENABLED = '1'
+      process.env.NANO_WALLETS_PAUSED = '1'
+      const paused = await settle({ 'src-xno': 'nano_1xno' })
+      assert.equal(paused.status, 503)
+      assert.equal(send.mock.callCount(), 0)
+    } finally {
+      delete process.env.SETTLE_PAYOUT_ENABLED
+      delete process.env.NANO_WALLET_SEND_ENABLED
+      delete process.env.NANO_WALLETS_PAUSED
     }
   })
 
@@ -156,6 +182,7 @@ describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate'
 
   it('when enabled, DENIES a non-XNO line item and never sends it', async (t) => {
     process.env.SETTLE_PAYOUT_ENABLED = 'true'
+    process.env.NANO_WALLET_SEND_ENABLED = '1' // Day 268: a payout is a send, so the send switch applies too
     const send = t.mock.method(rail, 'sendPayment', async () => fakeConfirmation())
 
     // Only the usd source has a destination; the xno source is skipped.
@@ -173,6 +200,7 @@ describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate'
 
   it('when enabled, PAYS a valid XNO line item once and records a signed receipt', async (t) => {
     process.env.SETTLE_PAYOUT_ENABLED = 'true'
+    process.env.NANO_WALLET_SEND_ENABLED = '1' // Day 268: a payout is a send, so the send switch applies too
     const send = t.mock.method(rail, 'sendPayment', async () => fakeConfirmation())
 
     // Only the xno source has a destination; the usd source is skipped.
@@ -197,6 +225,7 @@ describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate'
 
   it('mixed batch: sends only the XNO item, denies the usd item, exactly one send', async (t) => {
     process.env.SETTLE_PAYOUT_ENABLED = 'true'
+    process.env.NANO_WALLET_SEND_ENABLED = '1' // Day 268: a payout is a send, so the send switch applies too
     const send = t.mock.method(rail, 'sendPayment', async () => fakeConfirmation())
 
     const { status, body } = await settle({ 'src-usd': 'nano_1usd', 'src-xno': 'nano_1xno' })
@@ -213,6 +242,7 @@ describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate'
 
   it('when enabled, a malformed line item (no currency) is denied and recorded cleanly, never sent, no 500', async (t) => {
     process.env.SETTLE_PAYOUT_ENABLED = 'true'
+    process.env.NANO_WALLET_SEND_ENABLED = '1' // Day 268: a payout is a send, so the send switch applies too
     const send = t.mock.method(rail, 'sendPayment', async () => fakeConfirmation())
 
     const { status, body } = await settle({ 'src-bad': 'nano_1bad' }, SETTLEMENT_ID_MALFORMED)
