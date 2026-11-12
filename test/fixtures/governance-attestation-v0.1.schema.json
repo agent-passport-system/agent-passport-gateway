@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aeoess.com/schemas/governance-attestation-v0.1.json",
+  "title": "governance_attestation",
+  "type": "object",
+  "required": ["signal_type", "active_constraints", "delegation_chain_hash", "evaluation_timestamp"],
+  "properties": {
+    "signal_type": { "const": "governance_attestation" },
+    "active_constraints": {
+      "type": "object",
+      "required": ["scopes", "spend_used"],
+      "properties": {
+        "scopes": { "type": "array", "items": { "type": "string" } },
+        "spend_limit": { "type": ["number", "null"], "minimum": 0 },
+        "spend_used": { "type": "number", "minimum": 0 },
+        "spend_currency": { "type": "string" },
+        "tool_restrictions": { "type": "array", "items": { "type": "string" } },
+        "max_depth": { "type": "integer", "minimum": 0 },
+        "current_depth": { "type": "integer", "minimum": 0 },
+        "expires_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "delegation_chain_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "evaluation_timestamp": { "type": "string", "format": "date-time" },
+    "policy_version": { "type": "string" },
+    "gateway_id": { "type": "string" },
+    "attestation_grade": { "type": "integer", "minimum": 0, "maximum": 3 },
+    "expires_at": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}
