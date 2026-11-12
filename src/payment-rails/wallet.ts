@@ -56,13 +56,13 @@ export interface WalletTransaction {
 
 // ── Wallet Service ──
 
-import { xnoToRaw, rawToXno } from './nano.js'
+import { rawToXno } from './nano.js'
 import { getDB } from '../db/schema.js'
-import { toCents } from '../billing/money.js'
 import { NanoLocalWallet, NanoSendNotBroadcastError, getLocalWallet, deriveAddress, getMasterSeed } from './wallet-crypto.js'
 import { checkBoundAuthorityChain } from '../gateway/enforce.js'
-import { applyChainSpend, ancestorSpendViolation, boundChainSpendRows, chainSpendHold } from '../gateway/chain-spend.js'
-import type { ChainSpendRow } from '../gateway/chain-spend.js'
+import { boundChainSpendRows, chainSpendHold } from '../gateway/chain-spend.js'
+import { XNO_RAW, applyUnitSpend, parseMinor, rawToExactXno, unitChainRows, unitSpendViolation } from '../gateway/spend-units.js'
+import type { UnitRow } from '../gateway/spend-units.js'
 
 // Dynamic import for SDK scope matching (ESM)
 let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
@@ -230,26 +230,31 @@ export class AgentWalletService {
     tenantId: string
     fromAgentId: string
     toAddress: string
-    amountXno: number
+    /** Canonical decimal integer string of raw XNO. The one amount checked, debited and sent. */
+    amountRaw: string
     toAgentId?: string           // if sending to another APS agent
     memo?: string
   }): Promise<WalletTransaction> {
     const db = getDB()
-    const amountRaw = xnoToRaw(String(opts.amountXno))
     const txId = randomUUID()
+    // Day 268: the caller passes raw XNO as a canonical string (see parseSendAmount). Anything
+    // else is refused before any gate, so a rounded or malformed amount can never be debited or sent.
+    const amountRaw = parseMinor(opts.amountRaw) !== null && opts.amountRaw !== '0' ? opts.amountRaw : null
+    if (amountRaw === null) {
+      return this.recordDenied(txId, { ...opts, amountRaw: '0' }, '0', 'amount_raw_not_canonical_positive')
+    }
+    const amountXnoText = rawToExactXno(amountRaw)
 
-    // 0.4.3: Nano sends are off unless the operator opts in. Delegation spend limits are
-    // created in USD and this route debits XNO against the same counter, so a limit does
-    // not mean the same amount here. Until budgets carry their own unit, sending needs
-    // NANO_WALLET_SEND_ENABLED=1 and an operator who has accepted that.
-    // The operator pause wins over the enable flag.
+    // Nano sends are off unless the operator opts in, and the operator pause wins over the enable
+    // flag. Budgets now carry their own unit, but the legacy publish path in wallet-crypto.ts is
+    // closed, so an enabled send is refused there and its debit released.
     if (process.env.NANO_WALLETS_PAUSED === '1') {
       return this.recordDenied(txId, opts, amountRaw,
         'Nano wallets are paused by the operator (NANO_WALLETS_PAUSED=1).')
     }
     if (process.env.NANO_WALLET_SEND_ENABLED !== '1') {
       return this.recordDenied(txId, opts, amountRaw,
-        'Nano wallet send is disabled by default: delegation limits are in USD and this route debits XNO. Set NANO_WALLET_SEND_ENABLED=1 to enable it.')
+        'Nano wallet send is disabled by default, and publishing is closed in this release because there is no durable payment record before broadcast.')
     }
 
     // ── Gate 1: Wallet exists and is active ──
@@ -289,38 +294,29 @@ export class AgentWalletService {
       return this.recordDenied(txId, opts, amountRaw,
         `Delegation authority chain is invalid (code=${chainCheck.code}, hop=${chainCheck.hop})`)
     }
-    // ── Gate 3: Atomic spend limit check + optimistic debit (C3: prevents TOCTOU) ──
-    // Day 268: the send must also fit every bounded ancestor on the delegation's bound chain,
-    // and is debited on every row of that chain (see gateway/chain-spend.ts). The rows are kept
-    // here so a failed on-chain send reverses the same rows.
-    let chainRows: ChainSpendRow[] | null = null
+    // ── Gate 3: exact budget check and debit, in raw XNO (Day 268, explicit units) ──
+    // The send must fit the delegation and every bounded ancestor on its bound chain, each declared
+    // in nano:XNO:raw. A legacy row with a REAL limit has no proven unit and refuses the send. Amounts
+    // are BigInt raw, so nothing is rounded and nothing is converted from USD. The upgrade hold
+    // (gateway/chain-spend.ts) still applies. One IMMEDIATE transaction, so concurrent sends cannot
+    // both pass against the same remaining budget.
+    const amount = BigInt(amountRaw)
+    let unitRows: UnitRow[] | null = null
+    let spendRefusal = 'spend_refused'
     const spendCheckPassed = db.transaction(() => {
-      const freshDel = db.prepare(`SELECT spend_limit, spend_used FROM delegations WHERE id = ? AND tenant_id = ?`).get(delegation.id, opts.tenantId) as any
-      // Day 268: `!= null`, not truthiness. A spend_limit of 0 is a zero budget, not no limit.
-      if (freshDel && freshDel.spend_limit != null) {
-        const remaining = Math.round((freshDel.spend_limit - (freshDel.spend_used || 0)) * 1e6) / 1e6
-        const amount = Math.round(opts.amountXno * 1e6) / 1e6
-        if (amount > remaining) return false
-      }
-      const rows = boundChainSpendRows(db, opts.tenantId, delegation.id)
-      if (!rows) return false
-      if (chainSpendHold(db, rows)) return false
-      if (ancestorSpendViolation(rows, opts.amountXno, n => Math.round(n * 1e6) / 1e6)) return false
-      chainRows = rows
-      // C4 dual-write: mirror to spend_used_cents. Note: this column treats
-      // spend_used uniformly across rails — same convention as the REAL
-      // column already does (i.e. XNO and USD both accumulate here). The
-      // unit-confusion concern is pre-existing and will be addressed when
-      // we introduce a per-rail spend_used column in Phase B.
-      const incCents = toCents(opts.amountXno) || 0
-      applyChainSpend(db, rows, opts.amountXno, incCents)
+      const rows = unitChainRows(db, opts.tenantId, delegation.id)
+      if (!rows) { spendRefusal = 'delegation_chain_unreadable'; return false }
+      const holdRows = boundChainSpendRows(db, opts.tenantId, delegation.id)
+      if (!holdRows || chainSpendHold(db, holdRows)) { spendRefusal = 'chain_on_upgrade_hold'; return false }
+      const violation = unitSpendViolation(rows, XNO_RAW, amount)
+      if (violation) { spendRefusal = violation; return false }
+      applyUnitSpend(db, rows, amount)
+      unitRows = rows
       return true
     }).immediate()
 
     if (!spendCheckPassed) {
-      const remaining = Math.round((delegation.spend_limit - (delegation.spend_used || 0)) * 1e6) / 1e6
-      return this.recordDenied(txId, opts, amountRaw,
-        `Amount ${Math.round(opts.amountXno * 1e6) / 1e6} XNO exceeds remaining budget ${remaining} XNO`)
+      return this.recordDenied(txId, opts, amountRaw, `Send refused: ${spendRefusal} (amount ${amountRaw} raw XNO)`)
     }
 
     // ── Gate 4: Execute on-chain send ──
@@ -344,7 +340,7 @@ export class AgentWalletService {
         to_agent_id: opts.toAgentId,
         to_address: opts.toAddress,
         amount_raw: amountRaw,
-        amount_xno: String(opts.amountXno),
+        amount_xno: amountXnoText,
         block_hash: result.blockHash,
         delegation_id: delegation.id,
         scope_used: 'commerce:send',
@@ -360,9 +356,9 @@ export class AgentWalletService {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', datetime('now'))`)
         .run(txId, opts.tenantId, opts.fromAgentId,
           opts.toAgentId || null, opts.toAddress,
-          amountRaw, String(opts.amountXno), result.blockHash,
+          amountRaw, amountXnoText, result.blockHash,
           delegation.id, 'commerce:send')
-      try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'confirmed' } }) } catch {}
+      try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: amountXnoText, status: 'confirmed' } }) } catch {}
 
       return tx
 
@@ -377,39 +373,37 @@ export class AgentWalletService {
            delegation_id, scope_used, status, denial_reason)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
           .run(txId, opts.tenantId, opts.fromAgentId, opts.toAddress,
-            amountRaw, String(opts.amountXno), delegation.id,
+            amountRaw, amountXnoText, delegation.id,
             'commerce:send', `outcome_unknown: ${e?.message ?? String(e)}`)
-        try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'pending' } }) } catch {}
+        try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: amountXnoText, status: 'pending' } }) } catch {}
         return {
           id: txId, tenant_id: opts.tenantId,
           from_agent_id: opts.fromAgentId,
           to_address: opts.toAddress,
-          amount_raw: amountRaw, amount_xno: String(opts.amountXno),
+          amount_raw: amountRaw, amount_xno: amountXnoText,
           status: 'pending' as const, denial_reason: `outcome_unknown: ${e?.message ?? String(e)}`,
           created_at: new Date().toISOString(),
         }
       }
-      // Nothing was published: reverse the optimistic debit on every chain row.
-      // C4 dual-write: keep both columns in sync on the rollback.
-      const reverseCents = toCents(opts.amountXno) || 0
-      // chainRows is always set here: this path runs only after the transaction above
-      // debited it. Without rows there is nothing this send debited, so nothing to reverse.
-      if (chainRows) applyChainSpend(db, chainRows, -opts.amountXno, -reverseCents)
+      // Nothing was published: reverse the debit on every chain row, exactly.
+      // unitRows is always set here: this path runs only after the transaction above debited it.
+      const debited = unitRows as UnitRow[] | null
+      if (debited) db.transaction(() => applyUnitSpend(db, debited, -amount)).immediate()
 
       db.prepare(`INSERT INTO wallet_transactions
         (id, tenant_id, from_agent_id, to_address, amount_raw, amount_xno,
          delegation_id, scope_used, status, denial_reason)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?)`)
         .run(txId, opts.tenantId, opts.fromAgentId, opts.toAddress,
-          amountRaw, String(opts.amountXno), delegation.id,
+          amountRaw, amountXnoText, delegation.id,
           'commerce:send', e.message)
-      try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'failed' } }) } catch {}
+      try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: amountXnoText, status: 'failed' } }) } catch {}
 
       return {
         id: txId, tenant_id: opts.tenantId,
         from_agent_id: opts.fromAgentId,
         to_address: opts.toAddress,
-        amount_raw: amountRaw, amount_xno: String(opts.amountXno),
+        amount_raw: amountRaw, amount_xno: amountXnoText,
         status: 'failed' as const, denial_reason: e.message,
         created_at: new Date().toISOString(),
       }
@@ -419,18 +413,19 @@ export class AgentWalletService {
   /** Record a denied transaction */
   private recordDenied(
     txId: string,
-    opts: { tenantId: string; fromAgentId: string; toAddress: string; amountXno: number },
+    opts: { tenantId: string; fromAgentId: string; toAddress: string; amountRaw: string },
     amountRaw: string,
     reason: string,
   ): WalletTransaction {
     const db = getDB()
+    const amountXnoText = rawToExactXno(amountRaw)
     db.prepare(`INSERT INTO wallet_transactions
       (id, tenant_id, from_agent_id, to_address, amount_raw, amount_xno,
        status, denial_reason)
       VALUES (?, ?, ?, ?, ?, ?, 'denied', ?)`)
       .run(txId, opts.tenantId, opts.fromAgentId, opts.toAddress,
-        amountRaw, String(opts.amountXno), reason)
-    try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: opts.amountXno, status: 'denied', reason } }) } catch {}
+        amountRaw, amountXnoText, reason)
+    try { getEventBus().emit(opts.tenantId, { type: 'wallet_transaction', agentId: opts.fromAgentId, data: { tx_id: txId, direction: 'send', amount_xno: amountXnoText, status: 'denied', reason } }) } catch {}
 
     // Fire alert
     db.prepare(`INSERT INTO alerts (id, tenant_id, alert_type, severity, message)
@@ -443,7 +438,7 @@ export class AgentWalletService {
       id: txId, tenant_id: opts.tenantId,
       from_agent_id: opts.fromAgentId,
       to_address: opts.toAddress,
-      amount_raw: amountRaw, amount_xno: String(opts.amountXno),
+      amount_raw: amountRaw, amount_xno: amountXnoText,
       status: 'denied', denial_reason: reason,
       created_at: new Date().toISOString(),
     }

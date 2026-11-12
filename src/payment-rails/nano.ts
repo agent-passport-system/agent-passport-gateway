@@ -17,6 +17,9 @@ import type { PaymentRail, PaymentInvoice, PaymentConfirmation } from './types.j
 import { nanoRpc } from './rpc-client.js'
 import { getLocalWallet } from './wallet-crypto.js'
 
+/** The refusal sendPayment raises before doing anything. */
+export const SETTLEMENT_PAYOUT_CLOSED = 'Nano settlement payouts are closed in this release: nothing was signed or published'
+
 // ── Unit Conversion ──
 
 const RAW_PER_XNO = BigInt('1000000000000000000000000000000') // 10^30
@@ -191,22 +194,10 @@ export class NanoPaymentRail implements PaymentRail {
     amount: number        // in XNO
     memo?: string
   }): Promise<PaymentConfirmation> {
-    const amountRaw = xnoToRaw(String(opts.amount))
-    const start = Date.now()
-
-    // Use local crypto — gateway wallet is always seed index 0
-    const localWallet = getLocalWallet()
-    const result = await localWallet.send(0, opts.destination, amountRaw)
-
-    return {
-      invoiceId: randomUUID(),
-      rail: 'nano',
-      amount: opts.amount,
-      currency: 'XNO',
-      txProof: result.blockHash,
-      confirmedAt: new Date().toISOString(),
-      confirmationTimeMs: Date.now() - start,
-    }
+    // Settlement payouts publish from the gateway's own account and are closed with the rest of
+    // the legacy publish path. Refused before any key is derived or any node is called.
+    void opts
+    throw new Error(SETTLEMENT_PAYOUT_CLOSED)
   }
 
   /**

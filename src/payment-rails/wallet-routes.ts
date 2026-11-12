@@ -6,6 +6,7 @@
  * to prevent Express matching "dashboard" as an agentId.
  */
 
+import { parseSendAmount } from '../gateway/spend-units.js'
 import { Router } from 'express'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { getWalletService } from './wallet.js'
@@ -99,12 +100,15 @@ walletRouter.post('/wallets/send', rateLimit(sendLimiter), async (req: any, res)
   const tenant: Tenant = req.tenant
   try {
     const ws = getWalletService()
-    const { from_agent_id, to_address, amount_xno, to_agent_id, memo } = req.body
-    if (!from_agent_id || !to_address || !amount_xno) {
+    const { from_agent_id, to_address, to_agent_id, memo } = req.body
+    if (!from_agent_id || !to_address) {
       return res.status(400).json({
-        error: 'Required: from_agent_id, to_address, amount_xno',
+        error: 'Required: from_agent_id, to_address, and amount_raw or amount_xno',
       })
     }
+    // Day 268: one exact raw amount from the request, used for the check, the debit and the send.
+    const amount = parseSendAmount(req.body)
+    if ('error' in amount) return res.status(400).json({ error: amount.error })
 
     // Resolve destination: agent_id → nano address, or validate raw address
     let resolvedAddress = to_address
@@ -122,7 +126,7 @@ walletRouter.post('/wallets/send', rateLimit(sendLimiter), async (req: any, res)
       tenantId: tenant.id,
       fromAgentId: from_agent_id,
       toAddress: resolvedAddress,
-      amountXno: amount_xno,
+      amountRaw: amount.raw,
       toAgentId: to_agent_id,
       memo,
     })

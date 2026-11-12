@@ -173,30 +173,20 @@ async function generateWork(rpcUrl: string, hash: string): Promise<string> {
   return result.work
 }
 
-// ── Publish Block (public RPC) ──
-
-async function publishBlock(rpcUrl: string, block: any): Promise<string> {
-  const result = await nanoRpc(rpcUrl, {
-    action: 'process',
-    json_block: 'true',
-    subtype: block.subtype || 'send',
-    block: {
-      type: 'state',
-      account: block.account,
-      previous: block.previous,
-      representative: block.representative,
-      balance: block.balance,
-      link: block.link,
-      signature: block.signature,
-      work: block.work,
-    },
-  })
-  return result.hash
-}
+// ── Publish Block ──
+// The legacy publish path is closed in this release (see sendNano below).
 
 // ══════════════════════════════════════════════════════
 // Send Nano — local signing, remote work + publish
 // ══════════════════════════════════════════════════════
+
+/**
+ * The refusal both legacy publish paths raise before doing anything. This release has no durable
+ * record of a payment before its block is broadcast, so a crash or timeout while publishing could
+ * leave a send whose outcome the gateway cannot reconcile. Publishing stays closed until a
+ * payment lifecycle with that record is released.
+ */
+export const LEGACY_PUBLISH_CLOSED = 'Nano publishing is closed in this release: nothing was signed or published'
 
 /** Day 268: a send that failed before the block was handed to the network. Nothing was
  *  published, so the caller may release what it reserved for this send. Any other error
@@ -216,53 +206,8 @@ export async function sendNano(opts: {
   toAddress: string
   amountRaw: string
 }): Promise<{ blockHash: string; fromAddress: string }> {
-  let account: ReturnType<typeof deriveAccount>
-  let info: Awaited<ReturnType<typeof getAccountInfo>>
-  let newBalance: string
-  let work: string
-  let sendBlock: ReturnType<typeof nanoBlock.send>
-  try {
-    account = deriveAccount(opts.seed, opts.fromIndex)
-    info = await getAccountInfo(opts.rpcUrl, account.address)
-    if (!info.open) throw new Error(`Account ${account.address} has not been opened (no balance)`)
-
-    const currentBalance = BigInt(info.balance)
-    const sendAmount = BigInt(opts.amountRaw)
-    if (sendAmount > currentBalance) {
-      throw new Error(`Insufficient balance: have ${info.balance} raw, need ${opts.amountRaw} raw`)
-    }
-    newBalance = (currentBalance - sendAmount).toString()
-
-    // Generate work on the frontier
-    work = await generateWork(opts.rpcUrl, info.frontier)
-
-    // Build and sign block locally
-    sendBlock = nanoBlock.send({
-      walletBalanceRaw: info.balance,
-      fromAddress: account.address,
-      toAddress: opts.toAddress,
-      representativeAddress: info.representative || DEFAULT_REP,
-      frontier: info.frontier,
-      amountRaw: opts.amountRaw,
-      work,
-    }, account.privateKey)
-  } catch (e: any) {
-    throw new NanoSendNotBroadcastError(e?.message ?? String(e))
-  }
-
-  // Publish to network. From here an error does not mean nothing was sent.
-  const blockHash = await publishBlock(opts.rpcUrl, {
-    account: account.address,
-    previous: info.frontier,
-    representative: info.representative || DEFAULT_REP,
-    balance: newBalance,
-    link: nanoTools.addressToPublicKey(opts.toAddress),
-    signature: sendBlock.signature,
-    work,
-    subtype: 'send',
-  })
-
-  return { blockHash, fromAddress: account.address }
+  void opts
+  throw new NanoSendNotBroadcastError(LEGACY_PUBLISH_CLOSED)
 }
 
 // ══════════════════════════════════════════════════════
@@ -274,71 +219,8 @@ export async function receiveNano(opts: {
   seed: string
   accountIndex: number
 }): Promise<{ received: number; blocks: string[] }> {
-  const account = deriveAccount(opts.seed, opts.accountIndex)
-  const info = await getAccountInfo(opts.rpcUrl, account.address)
-
-  // Get receivable blocks
-  let receivable: any
-  try {
-    receivable = await nanoRpc(opts.rpcUrl, {
-      action: 'receivable',
-      account: account.address,
-      count: '100',
-      source: 'true',
-    })
-  } catch {
-    return { received: 0, blocks: [] }
-  }
-
-  const pendingBlocks = receivable.blocks
-  if (!pendingBlocks || typeof pendingBlocks !== 'object') return { received: 0, blocks: [] }
-
-  const hashes = Object.keys(pendingBlocks)
-  const blocks: string[] = []
-  let currentFrontier = info.frontier
-  let currentBalance = BigInt(info.balance)
-
-  for (const sendHash of hashes) {
-    try {
-      const amount = typeof pendingBlocks[sendHash] === 'object'
-        ? pendingBlocks[sendHash].amount
-        : pendingBlocks[sendHash]
-
-      const workHash = info.open ? currentFrontier : nanoTools.addressToPublicKey(account.address)
-      const work = await generateWork(opts.rpcUrl, workHash)
-
-      const newBalance = (currentBalance + BigInt(amount)).toString()
-
-      const receiveBlock = nanoBlock.receive({
-        walletBalanceRaw: currentBalance.toString(),
-        toAddress: account.address,
-        representativeAddress: info.representative || DEFAULT_REP,
-        frontier: currentFrontier,
-        transactionHash: sendHash,
-        amountRaw: amount,
-        work,
-      }, account.privateKey)
-
-      const blockHash = await publishBlock(opts.rpcUrl, {
-        account: account.address,
-        previous: currentFrontier === '0'.repeat(64) ? '0'.repeat(64) : currentFrontier,
-        representative: info.representative || DEFAULT_REP,
-        balance: newBalance,
-        link: sendHash,
-        signature: receiveBlock.signature,
-        work,
-        subtype: info.open ? 'receive' : 'open',
-      })
-
-      blocks.push(blockHash)
-      currentFrontier = blockHash
-      currentBalance = BigInt(newBalance)
-    } catch (e: any) {
-      console.error(`[NANO] Failed to receive ${sendHash}:`, e.message)
-    }
-  }
-
-  return { received: blocks.length, blocks }
+  void opts
+  throw new NanoSendNotBroadcastError(LEGACY_PUBLISH_CLOSED)
 }
 
 // ══════════════════════════════════════════════════════
