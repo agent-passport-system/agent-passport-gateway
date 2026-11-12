@@ -22,6 +22,7 @@ The public trust profile now reports a delegation's declared unit and exact limi
 
 - For a legacy delegation it no longer asserts a currency. 0.4.3 and earlier labelled every budget XNO, although the counters of a legacy budget may hold USD or XNO amounts.
 - For a unit-declared delegation the attestation is refused with `422 attestation_unavailable`, because the v0.1 schema cannot state an exact unit budget.
+- The attestation's `delegation_chain_hash` now matches the decision record's for the same chain. The attestation used to keep a `null` spend limit in the hashed chain and the decision record dropped it, so a chain with an unlimited link got two different hashes. Both now drop it, as the SDK canonicalization does. For such a chain the attestation's hash changes once, to the value decision records already carry. Other chains hash as before.
 
 The FinOps delegation view still reads the legacy budget columns and does not show unit-declared limits.
 

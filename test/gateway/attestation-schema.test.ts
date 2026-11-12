@@ -5,10 +5,9 @@
 // budget, no active delegation, and a unit-declared budget, which must get 422 and no signed claim.
 //
 // test/fixtures/governance-attestation-v0.1.schema.json is §1.6 of
-// agent-passport-system specs/governance-attestation-schema.md at 365f360, copied verbatim.
-// Known inconsistency in that draft: §1.2 lists `iss` as a required claim field, but the §1.6 JSON
-// Schema does not list it and sets additionalProperties false at the top level. This test follows
-// §1.2 for `iss` alone and applies §1.6 strictly to everything else, active_constraints included.
+// agent-passport-system specs/governance-attestation-schema.md, draft v0.1 erratum 1, copied
+// verbatim. Erratum 1 adds `iss` and `active_constraints.spend_limit` to the schema's required
+// fields. The whole claim is validated strictly, `iss` included.
 // ══════════════════════════════════════════════════════════════════
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -107,9 +106,7 @@ async function verifyEnvelope(body: any) {
 }
 
 function schemaErrors(claim: any): string[] {
-  const { iss, ...rest } = claim
-  assert.equal(typeof iss, 'string', '§1.2 requires iss')
-  return validate(SCHEMA, rest)
+  return validate(SCHEMA, claim)
 }
 
 describe('governance_attestation against draft v0.1', () => {
@@ -138,10 +135,14 @@ describe('governance_attestation against draft v0.1', () => {
   })
 
   it('the validator itself rejects what the old claims carried', () => {
-    const ok = { signal_type: 'governance_attestation', delegation_chain_hash: 'a'.repeat(64), evaluation_timestamp: '2026-11-11T00:00:00Z' }
-    assert.deepEqual(validate(SCHEMA, { ...ok, active_constraints: { scopes: [], spend_used: 0 } }), [])
-    assert.notDeepEqual(validate(SCHEMA, { ...ok, active_constraints: { scopes: [], spend_used: 0, spend_unit: null } }), [])
-    assert.notDeepEqual(validate(SCHEMA, { ...ok, active_constraints: { scopes: [], spend_used: 0, spend_currency: null } }), [])
-    assert.notDeepEqual(validate(SCHEMA, { ...ok, active_constraints: { scopes: [], spend_used: 0, spend_limit_minor: '1' } }), [])
+    const ok = { signal_type: 'governance_attestation', iss: 'https://gateway.aeoess.com', delegation_chain_hash: 'a'.repeat(64), evaluation_timestamp: '2026-11-11T00:00:00.123Z' }
+    const ac = { scopes: [], spend_limit: null, spend_used: 0 }
+    assert.deepEqual(validate(SCHEMA, { ...ok, active_constraints: ac }), [])
+    const { iss: _iss, ...noIss } = ok
+    assert.notDeepEqual(validate(SCHEMA, { ...noIss, active_constraints: ac }), [], 'erratum 1: iss is required')
+    assert.notDeepEqual(validate(SCHEMA, { ...ok, active_constraints: { scopes: [], spend_used: 0 } }), [], 'erratum 1: spend_limit is required')
+    assert.notDeepEqual(validate(SCHEMA, { ...ok, active_constraints: { ...ac, spend_unit: null } }), [])
+    assert.notDeepEqual(validate(SCHEMA, { ...ok, active_constraints: { ...ac, spend_currency: null } }), [])
+    assert.notDeepEqual(validate(SCHEMA, { ...ok, active_constraints: { ...ac, spend_limit_minor: '1' } }), [])
   })
 })

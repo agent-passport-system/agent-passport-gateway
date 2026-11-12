@@ -3,12 +3,13 @@
   "$id": "https://aeoess.com/schemas/governance-attestation-v0.1.json",
   "title": "governance_attestation",
   "type": "object",
-  "required": ["signal_type", "active_constraints", "delegation_chain_hash", "evaluation_timestamp"],
+  "required": ["signal_type", "iss", "active_constraints", "delegation_chain_hash", "evaluation_timestamp"],
   "properties": {
     "signal_type": { "const": "governance_attestation" },
+    "iss": { "type": "string" },
     "active_constraints": {
       "type": "object",
-      "required": ["scopes", "spend_used"],
+      "required": ["scopes", "spend_limit", "spend_used"],
       "properties": {
         "scopes": { "type": "array", "items": { "type": "string" } },
         "spend_limit": { "type": ["number", "null"], "minimum": 0 },
