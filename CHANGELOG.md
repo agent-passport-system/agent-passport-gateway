@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+**Explicit spending units on delegations.** A grant can declare `spend_unit` (`iso4217:USD:minor` or `nano:XNO:raw`) with `spend_limit_minor`, a canonical decimal integer string in that unit's minor denomination. Units are checked when a grant narrows its parent: a unit grant under a legacy bounded parent, a legacy grant under a unit parent, a different unit, or a limit above the parent's remaining budget is refused. `spend_limit` cannot be combined with `spend_unit`. Grants without a unit behave as before.
+
+**BREAKING: `POST /api/v1/wallets/send` takes an exact amount.** The body carries `amount_raw`, or `amount_xno` as an exact decimal string. A JSON number is refused, because it cannot carry 30 decimal places. The amount that is checked, debited and recorded is that one exact raw value. Every bounded delegation on the chain must be declared in `nano:XNO:raw`, and a legacy budget with no unit refuses the send, because the gateway does not convert between USD and XNO. The ancestor accounting and upgrade holds from 0.4.3 still apply.
+
+**`/evaluate` under a unit budget.** `/evaluate` accounts spending only in the legacy columns, so under a unit-declared delegation it refuses an action that carries a positive cost and any `commerce` action.
+
+**Reporting.** The trust profile and the signed governance attestation include the unit fields. A zero limit is reported as a zero budget, not as no limit. The attestation's currency comes from the unit, and is USD for legacy rows. Before, it said XNO for every row.
+
+**BREAKING: Nano publishing is closed.** Agent wallet sends, receives and settlement payouts refuse before deriving a key or calling a node, whatever `NANO_WALLET_SEND_ENABLED` and `SETTLE_PAYOUT_ENABLED` say. A send that reaches publishing is recorded as `failed` and its debit is released. This release still writes no durable payment record before a block is broadcast, so a crash or timeout while publishing could leave a send the gateway cannot reconcile. Publishing stays closed until a payment lifecycle with that record is released. Explicit units do not make Nano sending ready on their own.
+
+**Upgrading.** On startup the gateway adds the `spend_unit`, `spend_limit_minor` and `spend_used_minor` columns to `delegations` if they are missing, and refuses to start if one cannot be added. Existing rows keep `spend_unit` NULL and behave as legacy grants.
+
 ## 0.4.3 (2026-11-11)
 
 **Security: a delegation's budget did not cover spending below it (GHSA-w2v3-jgwx-8xjf).** In every earlier version, `POST /api/v1/evaluate` and `POST /api/v1/wallets/send` checked and debited only the acting agent's own delegation. Spending under a child delegation did not count against its parent's budget, so a grant that was split into sub-delegations could authorize more in total than the grant allowed.

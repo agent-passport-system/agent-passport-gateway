@@ -245,18 +245,16 @@ export class AgentWalletService {
     }
     const amountXnoText = rawToExactXno(amountRaw)
 
-    // 0.4.3: Nano sends are off unless the operator opts in. Delegation spend limits are
-    // created in USD and this route debits XNO against the same counter, so a limit does
-    // not mean the same amount here. Until budgets carry their own unit, sending needs
-    // NANO_WALLET_SEND_ENABLED=1 and an operator who has accepted that.
-    // The operator pause wins over the enable flag.
+    // Nano sends are off unless the operator opts in, and the operator pause wins over the enable
+    // flag. Budgets now carry their own unit, but the legacy publish path in wallet-crypto.ts is
+    // closed, so an enabled send is refused there and its debit released.
     if (process.env.NANO_WALLETS_PAUSED === '1') {
       return this.recordDenied(txId, opts, amountRaw,
         'Nano wallets are paused by the operator (NANO_WALLETS_PAUSED=1).')
     }
     if (process.env.NANO_WALLET_SEND_ENABLED !== '1') {
       return this.recordDenied(txId, opts, amountRaw,
-        'Nano wallet send is disabled by default: delegation limits are in USD and this route debits XNO. Set NANO_WALLET_SEND_ENABLED=1 to enable it.')
+        'Nano wallet send is disabled by default, and publishing is closed in this release because there is no durable payment record before broadcast.')
     }
 
     // ── Gate 1: Wallet exists and is active ──
