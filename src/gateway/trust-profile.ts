@@ -61,7 +61,11 @@ export interface TrustProfile {
   wallet_ref: Array<{ chain: string; address: string; bound_at: string; binding_sig: string }>
   matched_wallet?: { chain: string; address: string; bound_at: string; binding_sig: string }
   key_rotation: any | null
-  active_constraints: { scopes: string[]; spend_limit: number | null; spend_used: number } | null
+  active_constraints: {
+    scopes: string[]; spend_limit: number | null; spend_used: number
+    /** Day 268: a unit-declared budget. null on a legacy row. */
+    spend_unit: string | null; spend_limit_minor: string | null; spend_used_minor: string | null
+  } | null
   grade_computed_at: string
   last_activity_at: string
   attestation_bundle_hash: string | null
@@ -91,7 +95,7 @@ export function buildAgentTrustProfile(opts: BuildTrustProfileOpts): TrustProfil
 
   // Delegation
   const delegation = db.prepare(
-    `SELECT scope, spend_limit, spend_used FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
+    `SELECT scope, spend_limit, spend_used, spend_unit, spend_limit_minor, spend_used_minor FROM delegations WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
   ).get(tenantId, agentId) as any
 
   // Wallet (Nano)
@@ -202,8 +206,13 @@ export function buildAgentTrustProfile(opts: BuildTrustProfileOpts): TrustProfil
     key_rotation: keyRotation,
     active_constraints: delegation ? {
       scopes: delegation.scope ? delegation.scope.split(',').map((s: string) => s.trim()) : [],
-      spend_limit: delegation.spend_limit || null,
+      // `?? null`, not `|| null`: a zero limit is a zero budget, never reported as no limit.
+      spend_limit: delegation.spend_limit ?? null,
       spend_used: delegation.spend_used || 0,
+      // Day 268: a unit-declared budget, exactly. null on a legacy row, whose REAL limit is USD.
+      spend_unit: delegation.spend_unit ?? null,
+      spend_limit_minor: delegation.spend_limit_minor ?? null,
+      spend_used_minor: delegation.spend_used_minor ?? null,
     } : null,
     grade_computed_at: gradeComputedAt,
     last_activity_at: lastActivityAt,
@@ -245,6 +254,26 @@ export function buildAgentTrustProfile(opts: BuildTrustProfileOpts): TrustProfil
 }
 
 /** Strip private underscore-prefixed fields before sending over the wire. */
+/**
+ * The spend constraints carried in the signed governance_attestation claim. Day 268: the
+ * currency comes from the declared unit. A legacy row's REAL limit is USD, which is how the grant
+ * path has always stored it. Before this, every row was labelled 'XNO'.
+ */
+export function attestationSpendConstraints(delegation: any) {
+  if (!delegation) {
+    return { scopes: [] as string[], spend_limit: null, spend_used: 0, spend_currency: null, spend_unit: null, spend_limit_minor: null, spend_used_minor: null }
+  }
+  return {
+    scopes: delegation.scope ? String(delegation.scope).split(',').map((s: string) => s.trim()) : [],
+    spend_limit: delegation.spend_limit ?? null,
+    spend_used: delegation.spend_used ?? 0,
+    spend_currency: delegation.spend_unit === 'nano:XNO:raw' ? 'XNO' : 'USD',
+    spend_unit: delegation.spend_unit ?? null,
+    spend_limit_minor: delegation.spend_limit_minor ?? null,
+    spend_used_minor: delegation.spend_used_minor ?? null,
+  }
+}
+
 export function publicizeProfile(profile: TrustProfile): Record<string, any> {
   const out: Record<string, any> = {}
   for (const [k, v] of Object.entries(profile)) {

@@ -121,6 +121,30 @@ export function initDB(path: string = './gateway.db'): Database.Database {
 
 export function getDB(): Database.Database { return db }
 
+/** The delegation columns the explicit-units code requires (Day 268). */
+export const SPEND_UNIT_COLUMNS = ['spend_unit', 'spend_limit_minor', 'spend_used_minor'] as const
+
+/**
+ * Add any missing spend-unit column, then confirm all of them exist. Adds only what is missing,
+ * so it is idempotent and never touches existing rows. Any failure throws with the column named,
+ * and initDB, which the server calls before it listens, does not catch it.
+ */
+export function ensureSpendUnitColumns(database: Database.Database): void {
+  const columns = () => new Set((database.prepare(`PRAGMA table_info(delegations)`).all() as any[]).map(c => c.name))
+  const have = columns()
+  for (const c of SPEND_UNIT_COLUMNS) {
+    if (have.has(c)) continue
+    try {
+      database.exec(`ALTER TABLE delegations ADD COLUMN ${c} TEXT`)
+    } catch (e: any) {
+      throw new Error(`[migration] could not add delegations.${c}: ${e?.message ?? String(e)}`)
+    }
+  }
+  const after = columns()
+  const missing = SPEND_UNIT_COLUMNS.filter(c => !after.has(c))
+  if (missing.length) throw new Error(`[migration] delegations is missing required columns: ${missing.join(', ')}`)
+}
+
 function createTables() {
   db.exec(`
     -- Tenants (customers)
@@ -1002,6 +1026,10 @@ function createTables() {
   // migration once we add an explicit `currency` cents column per rail.
   try { db.exec(`ALTER TABLE delegations ADD COLUMN spend_limit_cents INTEGER`) } catch {}
   try { db.exec(`ALTER TABLE delegations ADD COLUMN spend_used_cents INTEGER DEFAULT 0`) } catch {}
+  // Day 268: explicit spending units (src/gateway/spend-units.ts). NULL spend_unit is a legacy row.
+  // Not inside try/catch: a column that cannot be added stops startup, so the server never serves
+  // requests against an incomplete schema (the public trust profile and the grant route read these).
+  ensureSpendUnitColumns(db)
   try { db.exec(`ALTER TABLE contributions ADD COLUMN amount_cents INTEGER DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE settlements ADD COLUMN total_amount_cents INTEGER DEFAULT 0`) } catch {}
 

@@ -10,6 +10,7 @@
  * GET  /api/v1/audit       — audit trail
  */
 
+import { unitNarrowingViolation, isSpendUnit, parseMinor } from './spend-units.js'
 import { Router } from 'express'
 import type Database from 'better-sqlite3'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
@@ -709,6 +710,19 @@ gatewayRouter.post('/evaluate', async (req: any, res) => {
       if (!scopeMatched) {
         verdict = 'deny'
         violations.push(`Scope "${scope_required}" not in [${delegation.scope}]`)
+      }
+      // Day 268: explicit units. /evaluate accounts spending only in the REAL columns and takes a
+      // caller-reported cost, so under a unit-declared delegation it refuses any action that carries
+      // a positive cost and any commerce action, whatever cost is reported. A zero or missing cost on
+      // a non-commerce action is permitted as before. A permit from here is never spend authority
+      // for a unit-declared budget: unit spending goes through the unit-aware route only.
+      if (delegation.spend_unit != null) {
+        const positiveCost = estimated_cost !== undefined && estimated_cost !== null && Number(estimated_cost) > 0
+        const commerce = /^commerce(:|$)/.test(String(scope_required))
+        if (positiveCost || commerce) {
+          verdict = 'deny'
+          violations.push(`Delegation is declared in ${delegation.spend_unit}. /evaluate does not account spending in that unit, so a ${commerce ? 'commerce action' : 'cost-bearing action'} is refused here. Use the unit-aware route.`)
+        }
       }
       // Reject a malformed or negative estimated_cost before any budget math. A negative cost would
       // slip past `estimated_cost > remaining` (a negative is never greater than the remaining
@@ -1710,6 +1724,9 @@ export function applyGrantWithReverify(
     childDepth: number
     wasOrigination: boolean
     parentDelId: string | null
+    /** Day 268: explicit spending unit, or null/absent for a legacy grant. */
+    spendUnit?: string | null
+    spendLimitMinor?: string | null
   },
 ): { demoted: boolean } {
   let demoted = false
@@ -1732,9 +1749,22 @@ export function applyGrantWithReverify(
       if (!chainCheck.ok) {
         throw new AuthorityChangedError(`the grantor's bound authority chain is no longer valid (code=${chainCheck.code}, hop=${chainCheck.hop})`)
       }
+      // Day 268: the unit rules, re-read inside the write lock, so a spend that committed after the
+      // route's check cannot leave the child above the parent's remaining budget.
+      const p = db.prepare(`SELECT id, spend_unit, spend_limit, spend_limit_minor, spend_used_minor FROM delegations WHERE id = ?`).get(opts.parentDelId) as any
+      const unitViolation = unitNarrowingViolation(p ?? null, { spend_unit: opts.spendUnit ?? null, spend_limit_minor: opts.spendLimitMinor ?? null })
+      if (unitViolation) {
+        throw new AuthorityChangedError(`the grantor's budget no longer allows this grant (${unitViolation})`)
+      }
     }
-    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth, parent_delegation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(opts.delegationId, opts.tenantId, opts.grantorId, opts.childId, opts.scope, opts.spendLimit, opts.spendLimitCents, opts.maxDepth, opts.childDepth, opts.parentDelId)
+    const unitDeclared = opts.spendUnit != null
+    db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, spend_limit, spend_limit_cents, max_depth, current_depth, parent_delegation_id, spend_unit, spend_limit_minor, spend_used_minor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(opts.delegationId, opts.tenantId, opts.grantorId, opts.childId, opts.scope,
+        // A unit-declared row carries a zero REAL budget, so code that reads only the REAL columns
+        // refuses to spend against it instead of reading an absent limit as no limit.
+        unitDeclared ? 0 : opts.spendLimit, unitDeclared ? 0 : opts.spendLimitCents,
+        opts.maxDepth, opts.childDepth, opts.parentDelId,
+        unitDeclared ? opts.spendUnit : null, unitDeclared ? (opts.spendLimitMinor ?? null) : null, unitDeclared ? '0' : null)
     // R4-1 audited demotion: if the CHILD is a designated root, receiving this inbound subordinates it.
     const childRoot = db.prepare(`SELECT is_root FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(opts.tenantId, opts.childId) as any
     if (childRoot && childRoot.is_root) {
@@ -1752,10 +1782,27 @@ export function applyGrantWithReverify(
 gatewayRouter.post('/delegations', (req: any, res) => {
   const tenant: Tenant = req.tenant
   const db = getDB()
-  const { parent_agent_id, child_agent_id, scope, spend_limit, max_depth } = req.body
+  const { parent_agent_id, child_agent_id, scope, spend_limit, max_depth, spend_unit, spend_limit_minor } = req.body
   if (!parent_agent_id || !child_agent_id || !scope) {
     return res.status(400).json({ error: 'Required: parent_agent_id, child_agent_id, scope' })
   }
+  // Day 268: explicit spending units. A unit-declared grant states its limit as a canonical decimal
+  // integer string in the unit's minor denomination (cents, or raw XNO), or omits it for no limit.
+  // spend_limit (a REAL number with no unit) cannot be combined with spend_unit.
+  if (spend_unit !== undefined && spend_unit !== null) {
+    if (!isSpendUnit(spend_unit)) {
+      return res.status(400).json({ error: 'spend_unit must be one of iso4217:USD:minor, nano:XNO:raw' })
+    }
+    if (spend_limit !== undefined && spend_limit !== null) {
+      return res.status(400).json({ error: 'spend_limit and spend_unit cannot both be set. Use spend_limit_minor with spend_unit.' })
+    }
+    if (spend_limit_minor !== undefined && spend_limit_minor !== null && parseMinor(spend_limit_minor) === null) {
+      return res.status(400).json({ error: 'spend_limit_minor must be a canonical decimal integer string' })
+    }
+  } else if (spend_limit_minor !== undefined && spend_limit_minor !== null) {
+    return res.status(400).json({ error: 'spend_limit_minor requires spend_unit' })
+  }
+  const unitDeclared = spend_unit !== undefined && spend_unit !== null
   // P3-6: verify agent exists (prevent phantom delegations)
   const childExists = db.prepare(`SELECT 1 FROM agents WHERE tenant_id = ? AND agent_id = ?`).get(tenant.id, child_agent_id) as any
   if (!childExists) return res.status(404).json({ error: `Agent "${child_agent_id}" not found in this tenant` })
@@ -1780,7 +1827,7 @@ gatewayRouter.post('/delegations', (req: any, res) => {
   // child (and, on /evaluate, which is charged) nondeterministic. (Reconciling MULTIPLE simultaneous
   // active inbounds into an aggregate budget remains an open design item; see REMEDIATION-MEMO.md.)
   const parentDel = db.prepare(
-    `SELECT id, scope, spend_limit, spend_used, max_depth, current_depth FROM delegations
+    `SELECT id, scope, spend_limit, spend_used, max_depth, current_depth, spend_unit, spend_limit_minor, spend_used_minor FROM delegations
      WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1`
   ).get(tenant.id, parent_agent_id) as any
 
@@ -1832,10 +1879,21 @@ gatewayRouter.post('/delegations', (req: any, res) => {
     }
   }
 
+  // Day 268: unit rules first. Ambiguity is refused: a unit grant under a legacy bounded parent, a
+  // legacy grant under a unit parent, a different unit, or a limit above the parent's remaining.
+  const unitViolation = unitNarrowingViolation(parentDel ?? null, {
+    spend_unit: unitDeclared ? spend_unit : null,
+    spend_limit_minor: unitDeclared ? (spend_limit_minor ?? null) : null,
+  })
+  if (unitViolation) {
+    return res.status(403).json({ error: 'Delegation escalation rejected', violations: [unitViolation] })
+  }
+
   const childScopeArr = Array.isArray(scope) ? scope.map(String) : String(scope).split(',').map((s: string) => s.trim()).filter(Boolean)
   const narrow = checkDelegationNarrowing(
     parentDel ? { scope: parentDel.scope, spend_limit: parentDel.spend_limit, spend_used: parentDel.spend_used, max_depth: parentDel.max_depth, current_depth: parentDel.current_depth } : null,
-    { scope: childScopeArr, spend_limit: (spend_limit ?? null) as number | null, max_depth: max_depth || 3 },
+    // A unit-declared child is stored with a zero REAL budget, and the REAL rules see exactly that.
+    { scope: childScopeArr, spend_limit: unitDeclared ? 0 : ((spend_limit ?? null) as number | null), max_depth: max_depth || 3 },
   )
   if (!narrow.ok) {
     return res.status(403).json({ error: 'Delegation escalation rejected', violations: narrow.violations })
@@ -1857,6 +1915,7 @@ gatewayRouter.post('/delegations', (req: any, res) => {
       tenantId: tenant.id, grantorId: parent_agent_id, childId: child_agent_id, delegationId: id,
       scope: Array.isArray(scope) ? scope.join(',') : scope, spendLimit: spendLimitUsd, spendLimitCents,
       maxDepth: max_depth || 3, childDepth, wasOrigination: !parentDel, parentDelId: parentDel ? parentDel.id : null,
+      spendUnit: unitDeclared ? spend_unit : null, spendLimitMinor: unitDeclared ? (spend_limit_minor ?? null) : null,
     })
     try { getEventBus().emit(tenant.id, { type: 'delegation_created', data: { delegation_id: id, parent_agent_id, child_agent_id, scope, spend_limit } }) } catch {}
     // R5-2: surface the audited auto-demotion operationally (mirrors delegation_created).

@@ -59,7 +59,7 @@ import helmet from 'helmet'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { initDB, getDB, PLAN_LIMITS, resolveTenantByEmail, addTenantAlias } from './db/schema.js'
 import { lookupByAddress, rebuildFromDb as rebuildWalletReverseIndex } from './gateway/wallet-reverse-index.js'
-import { buildAgentTrustProfile, publicizeProfile, type TrustProfile } from './gateway/trust-profile.js'
+import { attestationSpendConstraints, buildAgentTrustProfile, publicizeProfile, type TrustProfile } from './gateway/trust-profile.js'
 import { authMiddleware, requireAdmin, createTenant } from './auth/api-keys.js'
 import { createAuthRouter } from './auth/auth-router.js'
 import { gatewayRouter } from './gateway/enforce.js'
@@ -1224,14 +1224,7 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     const evalTs = new Date().toISOString()
     const expTs = new Date(Date.now() + 5 * 60 * 1000).toISOString()
     const chainHash = computeDelegationChainHash(db, tenantId, agentId)
-    const activeConstraints = delegation
-      ? {
-          scopes: delegation.scope ? delegation.scope.split(',').map((s: string) => s.trim()) : [],
-          spend_limit: delegation.spend_limit ?? null,
-          spend_used: delegation.spend_used ?? 0,
-          spend_currency: 'XNO',
-        }
-      : { scopes: [], spend_limit: null, spend_used: 0, spend_currency: 'XNO' }
+    const activeConstraints = attestationSpendConstraints(delegation)
 
     const claim = {
       signal_type: 'governance_attestation' as const,

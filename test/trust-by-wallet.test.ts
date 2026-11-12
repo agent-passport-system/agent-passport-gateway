@@ -49,6 +49,9 @@ function seedDb(): Database.Database {
       child_agent_id TEXT NOT NULL,
       scope TEXT NOT NULL,
       spend_limit REAL,
+      spend_unit TEXT,
+      spend_limit_minor TEXT,
+      spend_used_minor TEXT,
       spend_used REAL DEFAULT 0,
       max_depth INTEGER DEFAULT 3,
       status TEXT NOT NULL DEFAULT 'active',
@@ -366,7 +369,7 @@ describe('Trust profile emission — Solana wallet_ref preservation', () => {
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         metadata TEXT, UNIQUE(tenant_id, agent_id)
       );
-      CREATE TABLE delegations (id TEXT PRIMARY KEY, tenant_id TEXT, parent_agent_id TEXT, child_agent_id TEXT, scope TEXT, spend_limit REAL, spend_used REAL DEFAULT 0, max_depth INTEGER DEFAULT 3, status TEXT DEFAULT 'active', created_at TEXT DEFAULT (datetime('now')), revoked_at TEXT);
+      CREATE TABLE delegations (id TEXT PRIMARY KEY, tenant_id TEXT, parent_agent_id TEXT, child_agent_id TEXT, scope TEXT, spend_limit REAL, spend_used REAL DEFAULT 0, spend_unit TEXT, spend_limit_minor TEXT, spend_used_minor TEXT, max_depth INTEGER DEFAULT 3, status TEXT DEFAULT 'active', created_at TEXT DEFAULT (datetime('now')), revoked_at TEXT);
       CREATE TABLE policy_evaluations (id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, verdict TEXT, task_class TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')));
       CREATE TABLE receipts (id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, created_at TEXT DEFAULT (datetime('now')));
       CREATE TABLE issuance_dossiers (id TEXT PRIMARY KEY, tenant_id TEXT, passport_id TEXT, passport_grade INTEGER, attestation_bundle_hash TEXT, created_at TEXT DEFAULT (datetime('now')));
