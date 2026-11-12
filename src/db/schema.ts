@@ -145,6 +145,131 @@ export function ensureSpendUnitColumns(database: Database.Database): void {
   if (missing.length) throw new Error(`[migration] delegations is missing required columns: ${missing.join(', ')}`)
 }
 
+/** The wallet_ops columns the Nano lifecycle code requires (Day 268, lifecycle B). */
+export const WALLET_OPS_COLUMNS = [
+  'id', 'kind', 'tenant_id', 'idempotency_key', 'request_fingerprint', 'nano_account', 'wallet_id',
+  'from_agent_id', 'delegation_id', 'to_address', 'unit', 'amount_raw', 'source_hash', 'chain_rows',
+  'block_json', 'block_hash', 'block_previous', 'block_balance_raw', 'prev_balance_raw', 'status', 'claim_epoch',
+  'lease_owner', 'lease_until', 'admitted_at', 'last_attempt_at', 'attempt_count', 'cancel_reason',
+  'resolution', 'created_at', 'updated_at',
+] as const
+
+/**
+ * One row per Nano account-chain operation (send, receive, open). See
+ * src/payment-rails/wallet-ops.ts. The partial unique index allows one operation in flight per
+ * Nano account. The CHECKs hold two lifecycle rules in the database: a row past `reserved` has its
+ * block stored, and a row has publish attempts exactly when it is admitted, confirmed or
+ * failed_final (so a cancelled row never had an attempt). Not inside try/catch, and the columns
+ * are confirmed afterwards, so a table that exists with another shape stops startup.
+ */
+export function ensureWalletOpsTable(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS wallet_ops (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('send', 'receive', 'open')),
+      tenant_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      request_fingerprint TEXT NOT NULL,
+      nano_account TEXT NOT NULL,
+      wallet_id TEXT,
+      from_agent_id TEXT,
+      delegation_id TEXT,
+      to_address TEXT,
+      unit TEXT,
+      amount_raw TEXT NOT NULL,
+      source_hash TEXT,
+      chain_rows TEXT,
+      block_json TEXT,
+      block_hash TEXT,
+      block_previous TEXT,
+      block_balance_raw TEXT,
+      prev_balance_raw TEXT,
+      status TEXT NOT NULL CHECK (status IN ('reserved', 'prepared', 'admitted', 'confirmed', 'failed_final', 'cancelled')),
+      claim_epoch INTEGER NOT NULL DEFAULT 1,
+      lease_owner TEXT,
+      lease_until INTEGER,
+      admitted_at INTEGER,
+      last_attempt_at INTEGER,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      cancel_reason TEXT,
+      resolution TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (tenant_id, idempotency_key),
+      CHECK (status IN ('reserved', 'cancelled') OR (block_json IS NOT NULL AND block_hash IS NOT NULL AND block_previous IS NOT NULL AND block_balance_raw IS NOT NULL AND prev_balance_raw IS NOT NULL)),
+      CHECK ((attempt_count = 0) = (status IN ('reserved', 'prepared', 'cancelled'))),
+      CHECK (kind <> 'send' OR (delegation_id IS NOT NULL AND to_address IS NOT NULL AND unit = 'nano:XNO:raw' AND chain_rows IS NOT NULL))
+    );
+
+    -- One row per delegation a send's reservation debited (phase D). The operation's own record of
+    -- its debit: admission checks these rows, not the aggregate spend counter. held -> released
+    -- (cancel, failed_final) or held -> consumed (confirmed), each a compare-and-set committed
+    -- with the matching spend_used_minor change.
+    CREATE TABLE IF NOT EXISTS wallet_op_reservations (
+      op_id TEXT NOT NULL REFERENCES wallet_ops(id),
+      delegation_id TEXT NOT NULL,
+      unit TEXT NOT NULL CHECK (unit = 'nano:XNO:raw'),
+      amount_raw TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('held', 'released', 'consumed')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      settled_at TEXT,
+      PRIMARY KEY (op_id, delegation_id)
+    );
+
+    -- One row per committed publish attempt (phase C). Written in the same transaction that
+    -- admits the attempt, before any network call. outcome stays NULL until the call returns, so a
+    -- NULL outcome after a crash means a call may have begun.
+    CREATE TABLE IF NOT EXISTS wallet_op_attempts (
+      op_id TEXT NOT NULL REFERENCES wallet_ops(id),
+      attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+      claim_epoch INTEGER NOT NULL,
+      lease_owner TEXT NOT NULL,
+      block_hash TEXT NOT NULL,
+      committed_at INTEGER NOT NULL,
+      outcome TEXT CHECK (outcome IS NULL OR outcome IN ('accepted', 'hash_mismatch', 'error', 'skipped_paused')),
+      detail TEXT,
+      outcome_at INTEGER,
+      PRIMARY KEY (op_id, attempt_no)
+    );
+    -- Gate 1 (Day 268): the account state a send must be built on, recorded by an operator before the
+    -- first send and advanced only when the gateway confirms its own expected block. A node's
+    -- account_info that disagrees stops the send instead of overwriting this.
+    CREATE TABLE IF NOT EXISTS wallet_frontiers (
+      nano_account TEXT PRIMARY KEY,
+      wallet_id TEXT NOT NULL,
+      frontier TEXT NOT NULL CHECK (length(frontier) = 64),
+      balance_raw TEXT NOT NULL,
+      initialized_by TEXT NOT NULL,
+      evidence TEXT NOT NULL,
+      initialized_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_op_id TEXT
+    );
+  `)
+  const have = new Set((database.prepare(`PRAGMA table_info(wallet_ops)`).all() as any[]).map(c => c.name))
+  const missing = WALLET_OPS_COLUMNS.filter(c => !have.has(c))
+  if (missing.length) throw new Error(`[migration] wallet_ops is missing required columns: ${missing.join(', ')}`)
+  const attemptCols = new Set((database.prepare(`PRAGMA table_info(wallet_op_attempts)`).all() as any[]).map(c => c.name))
+  const missingAttempt = ['op_id', 'attempt_no', 'claim_epoch', 'lease_owner', 'block_hash', 'committed_at', 'outcome', 'detail', 'outcome_at']
+    .filter(c => !attemptCols.has(c))
+  if (missingAttempt.length) throw new Error(`[migration] wallet_op_attempts is missing required columns: ${missingAttempt.join(', ')}`)
+  const resCols = new Set((database.prepare(`PRAGMA table_info(wallet_op_reservations)`).all() as any[]).map(c => c.name))
+  const missingRes = ['op_id', 'delegation_id', 'unit', 'amount_raw', 'status', 'created_at', 'settled_at'].filter(c => !resCols.has(c))
+  if (missingRes.length) throw new Error(`[migration] wallet_op_reservations is missing required columns: ${missingRes.join(', ')}`)
+  const frontierCols = new Set((database.prepare(`PRAGMA table_info(wallet_frontiers)`).all() as any[]).map(c => c.name))
+  const missingFrontier = ['nano_account', 'wallet_id', 'frontier', 'balance_raw', 'initialized_by', 'evidence', 'initialized_at', 'updated_at', 'last_op_id']
+    .filter(c => !frontierCols.has(c))
+  if (missingFrontier.length) throw new Error(`[migration] wallet_frontiers is missing required columns: ${missingFrontier.join(', ')}`)
+  // Indexes last, so a table of another shape fails above with its missing columns named.
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_wallet_ops_active_account
+      ON wallet_ops(nano_account) WHERE status IN ('reserved', 'prepared', 'admitted');
+    CREATE INDEX IF NOT EXISTS idx_wallet_ops_status ON wallet_ops(status, lease_until);
+  `)
+  const slot = (database.prepare(`PRAGMA index_list(wallet_ops)`).all() as any[]).find(i => i.name === 'uq_wallet_ops_active_account')
+  if (!slot || slot.unique !== 1 || slot.partial !== 1) throw new Error('[migration] wallet_ops is missing the one-operation-per-account index')
+}
+
 function createTables() {
   db.exec(`
     -- Tenants (customers)
@@ -1030,6 +1155,8 @@ function createTables() {
   // Not inside try/catch: a column that cannot be added stops startup, so the server never serves
   // requests against an incomplete schema (the public trust profile and the grant route read these).
   ensureSpendUnitColumns(db)
+  // Day 268, lifecycle B: the Nano account-chain operation table. Same rule, not inside try/catch.
+  ensureWalletOpsTable(db)
   try { db.exec(`ALTER TABLE contributions ADD COLUMN amount_cents INTEGER DEFAULT 0`) } catch {}
   try { db.exec(`ALTER TABLE settlements ADD COLUMN total_amount_cents INTEGER DEFAULT 0`) } catch {}
 

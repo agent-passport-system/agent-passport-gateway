@@ -161,7 +161,7 @@ export async function getAccountInfo(rpcUrl: string, address: string): Promise<{
 }
 
 // ── Default representative (Nano Foundation) ──
-const DEFAULT_REP = 'nano_1stofnrxuz3cai7ze75o174bpm7scwj9jn3nxsn8ntzg784jf1gzn1jjdkou'
+export const DEFAULT_REP = 'nano_1stofnrxuz3cai7ze75o174bpm7scwj9jn3nxsn8ntzg784jf1gzn1jjdkou'
 
 // ── Work Generation (public RPC) ──
 
@@ -174,24 +174,20 @@ async function generateWork(rpcUrl: string, hash: string): Promise<string> {
 }
 
 // ── Publish Block ──
-// The legacy publish path is closed in this release (see sendNano below).
+// Day 268, lifecycle C: the only Nano `process` call is publishAttempt in nano-publish.ts, behind
+// a committed attempt. This file no longer publishes.
 
 // ══════════════════════════════════════════════════════
 // Send Nano — local signing, remote work + publish
 // ══════════════════════════════════════════════════════
 
-/**
- * The refusal both legacy publish paths raise before doing anything. This release has no durable
- * record of a payment before its block is broadcast, so a crash or timeout while publishing could
- * leave a send whose outcome the gateway cannot reconcile. Publishing stays closed until a
- * payment lifecycle with that record is released.
- */
-export const LEGACY_PUBLISH_CLOSED = 'Nano publishing is closed in this release: nothing was signed or published'
-
 /** Day 268: a send that failed before the block was handed to the network. Nothing was
  *  published, so the caller may release what it reserved for this send. Any other error
  *  from sendNano happened during or after publishing, and the caller must treat the
  *  outcome as unknown: the block may still be accepted. */
+/** The refusal both legacy publish paths raise before doing anything. */
+export const LEGACY_PUBLISH_CLOSED = 'the legacy Nano publish path is closed: nothing was signed or published (Day 268 lifecycle)'
+
 export class NanoSendNotBroadcastError extends Error {
   constructor(message: string) {
     super(message)
@@ -206,6 +202,8 @@ export async function sendNano(opts: {
   toAddress: string
   amountRaw: string
 }): Promise<{ blockHash: string; fromAddress: string }> {
+  // Day 268, lifecycle C: this path published outside the lifecycle. It is closed before any key
+  // is derived or any node is called. Sends go through wallet_ops and nano-publish.ts.
   void opts
   throw new NanoSendNotBroadcastError(LEGACY_PUBLISH_CLOSED)
 }
@@ -219,6 +217,7 @@ export async function receiveNano(opts: {
   seed: string
   accountIndex: number
 }): Promise<{ received: number; blocks: string[] }> {
+  // Day 268, lifecycle C: closed like sendNano. Receives go through wallet_ops.
   void opts
   throw new NanoSendNotBroadcastError(LEGACY_PUBLISH_CLOSED)
 }

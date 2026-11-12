@@ -63,6 +63,7 @@ import { checkBoundAuthorityChain } from '../gateway/enforce.js'
 import { boundChainSpendRows, chainSpendHold } from '../gateway/chain-spend.js'
 import { XNO_RAW, applyUnitSpend, parseMinor, rawToExactXno, unitChainRows, unitSpendViolation } from '../gateway/spend-units.js'
 import type { UnitRow } from '../gateway/spend-units.js'
+import { reserveSend, WalletOpError, type Claim, type WalletOp } from './wallet-ops.js'
 
 // Dynamic import for SDK scope matching (ESM)
 let _scopeAuthorizes: ((scopes: string[], required: string) => boolean) | null = null
@@ -75,10 +76,17 @@ async function loadScopeAuthorizes() {
 }
 
 export class AgentWalletService {
-  private localWallet: NanoLocalWallet
+  private injectedWallet: NanoLocalWallet | undefined
+
+  // Day 268: loaded on first use, not at construction. The lifecycle routes never need the local
+  // wallet, and loading it reads the master seed, which a paused or seedless gateway refuses.
+  private get localWallet(): NanoLocalWallet {
+    if (!this.injectedWallet) this.injectedWallet = getLocalWallet()
+    return this.injectedWallet
+  }
 
   constructor(opts?: { localWallet?: NanoLocalWallet }) {
-    this.localWallet = opts?.localWallet || getLocalWallet()
+    this.injectedWallet = opts?.localWallet
   }
 
   /**
@@ -245,55 +253,10 @@ export class AgentWalletService {
     }
     const amountXnoText = rawToExactXno(amountRaw)
 
-    // Nano sends are off unless the operator opts in, and the operator pause wins over the enable
-    // flag. Budgets now carry their own unit, but the legacy publish path in wallet-crypto.ts is
-    // closed, so an enabled send is refused there and its debit released.
-    if (process.env.NANO_WALLETS_PAUSED === '1') {
-      return this.recordDenied(txId, opts, amountRaw,
-        'Nano wallets are paused by the operator (NANO_WALLETS_PAUSED=1).')
-    }
-    if (process.env.NANO_WALLET_SEND_ENABLED !== '1') {
-      return this.recordDenied(txId, opts, amountRaw,
-        'Nano wallet send is disabled by default, and publishing is closed in this release because there is no durable payment record before broadcast.')
-    }
+    const gate = await this.sendGates(txId, opts, amountRaw)
+    if ('denied' in gate) return gate.denied
+    const { wallet, delegation } = gate
 
-    // ── Gate 1: Wallet exists and is active ──
-    const wallet = db.prepare(
-      `SELECT * FROM agent_wallets WHERE tenant_id = ? AND agent_id = ? AND status = 'active'`
-    ).get(opts.tenantId, opts.fromAgentId) as AgentWallet | undefined
-    if (!wallet) {
-      return this.recordDenied(txId, opts, amountRaw, 'No active wallet for agent')
-    }
-
-    // ── Gate 2: Active delegation with commerce scope ──
-    // Uses SDK scopeAuthorizes() — respects monotonic narrowing invariant
-    const delegation = db.prepare(`
-      SELECT * FROM delegations
-      WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
-      ORDER BY created_at DESC LIMIT 1
-    `).get(opts.tenantId, opts.fromAgentId) as any
-    if (!delegation) {
-      return this.recordDenied(txId, opts, amountRaw, 'No active delegation for agent')
-    }
-
-    const scopes = delegation.scope.split(',').map((s: string) => s.trim())
-    const scopeAuth = await loadScopeAuthorizes()
-    const hasCommerceScope = scopeAuth
-      ? scopeAuth(scopes, 'commerce:send')
-      : scopes.some((s: string) => s === '*' || s === 'commerce:*' || s === 'commerce:send')
-    if (!hasCommerceScope) {
-      return this.recordDenied(txId, opts, amountRaw,
-        `Agent lacks commerce:send scope. Has: [${delegation.scope}]`)
-    }
-
-    // ── Gate 2b (Day 268): the delegation's whole bound chain must still be authoritative ──
-    // A revoked, suspended or frozen grantor anywhere up the chain ends this send, the same
-    // rule /evaluate applies.
-    const chainCheck = checkBoundAuthorityChain(db, opts.tenantId, delegation.id)
-    if (!chainCheck.ok) {
-      return this.recordDenied(txId, opts, amountRaw,
-        `Delegation authority chain is invalid (code=${chainCheck.code}, hop=${chainCheck.hop})`)
-    }
     // ── Gate 3: exact budget check and debit, in raw XNO (Day 268, explicit units) ──
     // The send must fit the delegation and every bounded ancestor on its bound chain, each declared
     // in nano:XNO:raw. A legacy row with a REAL limit has no proven unit and refuses the send. Amounts
@@ -408,6 +371,118 @@ export class AgentWalletService {
         created_at: new Date().toISOString(),
       }
     }
+  }
+
+  /**
+   * The send gates in order, shared by send() and the lifecycle's reserveSendOp(): the pause, the
+   * send switch, an active wallet, an active delegation with commerce:send, and a bound chain that
+   * is still authoritative. A refusal is recorded as a denied transaction, as before.
+   */
+  private async sendGates(
+    txId: string,
+    opts: { tenantId: string; fromAgentId: string; toAddress: string; amountRaw: string },
+    amountRaw: string,
+  ): Promise<{ denied: WalletTransaction } | { wallet: AgentWallet; delegation: any }> {
+    const db = getDB()
+    // Nano sends are off unless the operator opts in with NANO_WALLET_SEND_ENABLED=1.
+    // The operator pause wins over the enable flag.
+    if (process.env.NANO_WALLETS_PAUSED === '1') {
+      return { denied: this.recordDenied(txId, opts, amountRaw,
+        'Nano wallets are paused by the operator (NANO_WALLETS_PAUSED=1).') }
+    }
+    if (process.env.NANO_WALLET_SEND_ENABLED !== '1') {
+      return { denied: this.recordDenied(txId, opts, amountRaw,
+        'Nano wallet send is disabled by default. Set NANO_WALLET_SEND_ENABLED=1 to turn the send switch on.') }
+    }
+
+    // ── Gate 1: Wallet exists and is active ──
+    const wallet = db.prepare(
+      `SELECT * FROM agent_wallets WHERE tenant_id = ? AND agent_id = ? AND status = 'active'`
+    ).get(opts.tenantId, opts.fromAgentId) as AgentWallet | undefined
+    if (!wallet) {
+      return { denied: this.recordDenied(txId, opts, amountRaw, 'No active wallet for agent') }
+    }
+
+    // ── Gate 2: Active delegation with commerce scope ──
+    // Uses SDK scopeAuthorizes() — respects monotonic narrowing invariant
+    const delegation = db.prepare(`
+      SELECT * FROM delegations
+      WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
+      ORDER BY created_at DESC LIMIT 1
+    `).get(opts.tenantId, opts.fromAgentId) as any
+    if (!delegation) {
+      return { denied: this.recordDenied(txId, opts, amountRaw, 'No active delegation for agent') }
+    }
+
+    const scopes = delegation.scope.split(',').map((s: string) => s.trim())
+    const scopeAuth = await loadScopeAuthorizes()
+    const hasCommerceScope = scopeAuth
+      ? scopeAuth(scopes, 'commerce:send')
+      : scopes.some((s: string) => s === '*' || s === 'commerce:*' || s === 'commerce:send')
+    if (!hasCommerceScope) {
+      return { denied: this.recordDenied(txId, opts, amountRaw,
+        `Agent lacks commerce:send scope. Has: [${delegation.scope}]`) }
+    }
+
+    // ── Gate 2b (Day 268): the delegation's whole bound chain must still be authoritative ──
+    // A revoked, suspended or frozen grantor anywhere up the chain ends this send, the same
+    // rule /evaluate applies.
+    const chainCheck = checkBoundAuthorityChain(db, opts.tenantId, delegation.id)
+    if (!chainCheck.ok) {
+      return { denied: this.recordDenied(txId, opts, amountRaw,
+        `Delegation authority chain is invalid (code=${chainCheck.code}, hop=${chainCheck.hop})`) }
+    }
+    return { wallet, delegation }
+  }
+
+  /**
+   * Day 268 lifecycle: reserve a send as a wallet_ops row after the same gates as send(). Nothing is
+   * signed or published here. The caller runs the operation (wallet-reconcile.ts runOp).
+   */
+  async reserveSendOp(opts: {
+    tenantId: string
+    fromAgentId: string
+    toAddress: string
+    amountRaw: string
+    idempotencyKey: string
+    claim: Claim
+    /** The runner's readiness: null when the lifecycle can take a new send. */
+    notReady: string | null
+  }): Promise<{ denied: WalletTransaction; notReady?: string } | { op: WalletOp; replay: boolean }> {
+    const txId = randomUUID()
+    const amountRaw = parseMinor(opts.amountRaw) !== null && opts.amountRaw !== '0' ? opts.amountRaw : null
+    if (amountRaw === null) {
+      return { denied: this.recordDenied(txId, { ...opts, amountRaw: '0' }, '0', 'amount_raw_not_canonical_positive') }
+    }
+    // A key already used answers before the gates, so a client retrying after a revocation learns
+    // what happened to its payment instead of getting a new denial. Same agent, destination and
+    // amount is a replay. Anything else under that key is a mismatch.
+    const existing = getDB().prepare(`SELECT * FROM wallet_ops WHERE tenant_id = ? AND idempotency_key = ?`)
+      .get(opts.tenantId, opts.idempotencyKey) as WalletOp | undefined
+    if (existing) {
+      if (existing.kind !== 'send' || existing.from_agent_id !== opts.fromAgentId || existing.to_address !== opts.toAddress || existing.amount_raw !== amountRaw) {
+        throw new WalletOpError('idempotency_mismatch', 'this idempotency key was used for a different request')
+      }
+      return { op: existing, replay: true }
+    }
+    const gate = await this.sendGates(txId, opts, amountRaw)
+    if ('denied' in gate) return gate
+    // Activation gate 2: no new reservation unless the lifecycle that would run it is installed and
+    // healthy. NANO_RAIL_DISABLED=1 stops new sends here too, not only recovery. The pause and the
+    // send switch above still answer first.
+    const notReady = process.env.NANO_RAIL_DISABLED === '1' ? 'nano_rail_disabled' : opts.notReady
+    if (notReady) {
+      return { denied: this.recordDenied(txId, opts, amountRaw, `Nano lifecycle is not ready (${notReady}): nothing was reserved.`), notReady }
+    }
+    const r = reserveSend(getDB(), {
+      tenantId: opts.tenantId, idempotencyKey: opts.idempotencyKey, fromAgentId: opts.fromAgentId,
+      walletId: gate.wallet.id, nanoAccount: gate.wallet.nano_address, delegationId: gate.delegation.id,
+      toAddress: opts.toAddress, amountRaw,
+    }, opts.claim)
+    if ('refused' in r) {
+      return { denied: this.recordDenied(txId, opts, amountRaw, `Send refused: ${r.refused} (amount ${amountRaw} raw XNO)`) }
+    }
+    return r
   }
 
   /** Record a denied transaction */

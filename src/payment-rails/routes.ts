@@ -154,6 +154,10 @@ paymentRouter.post('/pay/nano/settle/:id', async (req: any, res) => {
 
   try {
     const nano = getNanoRail()
+    // Day 268: a payout is an outbound Nano send, so the wallet pause and the send switch apply.
+    if (process.env.NANO_WALLETS_PAUSED === '1' || process.env.NANO_WALLET_SEND_ENABLED !== '1') {
+      return res.status(503).json({ error: 'nano_send_not_enabled', message: 'Nano sends are paused or not enabled, so no payout is sent.' })
+    }
     const settlement = db.prepare(
       `SELECT * FROM settlements WHERE id = ? AND tenant_id = ?`
     ).get(req.params.id, tenant.id) as any

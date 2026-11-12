@@ -10,6 +10,10 @@ import { parseSendAmount } from '../gateway/spend-units.js'
 import { Router } from 'express'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { getWalletService } from './wallet.js'
+import { getDB } from '../db/schema.js'
+import { addressToPublicKey } from './nano-block.js'
+import { WalletOpError, getOp, type WalletOp } from './wallet-ops.js'
+import { getOpRunner } from './wallet-reconcile.js'
 import type { Tenant } from '../auth/api-keys.js'
 
 export const walletRouter = Router()
@@ -100,52 +104,72 @@ walletRouter.post('/wallets/send', rateLimit(sendLimiter), async (req: any, res)
   const tenant: Tenant = req.tenant
   try {
     const ws = getWalletService()
-    const { from_agent_id, to_address, to_agent_id, memo } = req.body
+    const { from_agent_id, to_address, to_agent_id } = req.body
     if (!from_agent_id || !to_address) {
       return res.status(400).json({
         error: 'Required: from_agent_id, to_address, and amount_raw or amount_xno',
       })
     }
-    // Day 268: one exact raw amount from the request, used for the check, the debit and the send.
+    // Day 268 lifecycle: one payment per key. A retry with the same key returns the same operation.
+    const idempotencyKey = req.get('Idempotency-Key')
+    if (!idempotencyKey) return res.status(400).json({ error: 'Required header: Idempotency-Key' })
     const amount = parseSendAmount(req.body)
     if ('error' in amount) return res.status(400).json({ error: amount.error })
 
-    // Resolve destination: agent_id → nano address, or validate raw address
     let resolvedAddress = to_address
     if (to_agent_id && !to_address.startsWith('nano_')) {
       const targetWallet = ws.getWallet(tenant.id, to_agent_id)
       if (targetWallet) resolvedAddress = targetWallet.nano_address
     }
-
-    // Bug #14 fix: validate Nano address format
-    if (!resolvedAddress.startsWith('nano_') || resolvedAddress.length !== 65) {
+    try { addressToPublicKey(resolvedAddress) } catch {
       return res.status(400).json({ error: `Invalid Nano address: ${resolvedAddress}` })
     }
 
-    const tx = await ws.send({
-      tenantId: tenant.id,
-      fromAgentId: from_agent_id,
-      toAddress: resolvedAddress,
-      amountRaw: amount.raw,
-      toAgentId: to_agent_id,
-      memo,
+    const runner = getOpRunner()
+    const r = await ws.reserveSendOp({
+      tenantId: tenant.id, fromAgentId: from_agent_id, toAddress: resolvedAddress, amountRaw: amount.raw,
+      idempotencyKey, claim: { owner: runner.owner, now: runner.now(), leaseMs: runner.leaseMs },
+      notReady: runner.readiness(),
     })
-
-    const statusCode = tx.status === 'denied' ? 403 : tx.status === 'failed' ? 500 : 200
-    res.status(statusCode).json({
-      transaction_id: tx.id,
-      status: tx.status,
-      block_hash: tx.block_hash || null,
-      amount_xno: tx.amount_xno,
-      from: from_agent_id,
-      to: resolvedAddress,
-      delegation_id: tx.delegation_id || null,
-      denial_reason: tx.denial_reason || null,
-    })
+    if ('denied' in r) {
+      // 503 when the lifecycle is not ready, so a client retries later. 403 for every other denial.
+      return res.status(r.notReady ? 503 : 403).json({ status: 'denied', transaction_id: r.denied.id, denial_reason: r.denied.denial_reason || null })
+    }
+    if (!r.replay) runner.schedule(r.op.id)
+    // 202: the payment is reserved. It is not sent or confirmed until GET /wallets/ops/:id says so.
+    res.status(202).json(opView(r.op, r.replay))
   } catch (e: any) {
+    if (e instanceof WalletOpError) {
+      const code = e.code === 'bad_request' ? 400 : 409
+      return res.status(code).json({ error: e.code, message: e.message })
+    }
     res.status(500).json({ error: e.message })
   }
 })
+
+// ── GET /wallets/ops/:id — one lifecycle operation, as the database has it ──
+walletRouter.get('/wallets/ops/:id', (req: any, res) => {
+  const tenant: Tenant = req.tenant
+  const op = getOp(getDB(), req.params.id)
+  if (!op || op.tenant_id !== tenant.id) return res.status(404).json({ error: 'not_found' })
+  res.json(opView(op, false))
+})
+
+function opView(op: WalletOp, replay: boolean) {
+  return {
+    operation_id: op.id,
+    kind: op.kind,
+    status: op.status,
+    replay,
+    from_agent_id: op.from_agent_id,
+    to_address: op.to_address,
+    amount_raw: op.amount_raw,
+    block_hash: op.block_hash,
+    attempts: op.attempt_count,
+    resolution: op.status === 'confirmed' || op.status === 'failed_final' ? JSON.parse(op.resolution ?? 'null') : null,
+    cancel_reason: op.cancel_reason,
+  }
+}
 
 // ═══════════════════════════════════════
 // PARAMETERIZED ROUTES (:agentId)
@@ -164,19 +188,9 @@ walletRouter.get('/wallets/:agentId/balance', async (req: any, res) => {
 })
 
 // ── POST /wallets/:agentId/receive — Pocket pending funds ──
-walletRouter.post('/wallets/:agentId/receive', async (req: any, res) => {
-  const tenant: Tenant = req.tenant
-  try {
-    const ws = getWalletService()
-    const result = await ws.receiveAll(tenant.id, req.params.agentId)
-    res.json({
-      agent_id: req.params.agentId,
-      received_count: result.received,
-      blocks: result.blocks,
-    })
-  } catch (e: any) {
-    res.status(404).json({ error: e.message })
-  }
+walletRouter.post('/wallets/:agentId/receive', async (_req: any, res) => {
+  // Day 268 lifecycle: receives are not on wallet_ops routes yet, and the old receive path is closed.
+  res.status(503).json({ error: 'receive_not_available', message: 'receive is not on the Nano lifecycle yet: nothing was signed or published' })
 })
 
 // ── GET /wallets/:agentId/txs — Transaction history ──

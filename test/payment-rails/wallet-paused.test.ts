@@ -11,11 +11,13 @@ import type { Server } from 'node:http'
 import { initDB, getDB } from '../../src/db/schema.js'
 import { initGatewayIdentity } from '../../src/gateway/identity.js'
 import { walletRouter } from '../../src/payment-rails/wallet-routes.js'
+import { setGenerousPilotCaps, initFrontier } from './pilot-fixtures.js'
 
 const TENANT = 'tnt_paused'
 let server: Server, baseUrl: string
 
 before(async () => {
+  setGenerousPilotCaps()
   process.env.NANO_WALLETS_PAUSED = '1'
   initDB(':memory:')
   initGatewayIdentity()
@@ -35,14 +37,17 @@ after(() => { server?.close(); delete process.env.NANO_WALLETS_PAUSED })
 describe('paused Nano wallets', () => {
   it('POST /wallets/send is refused and nothing is debited or recorded', async () => {
     const r = await fetch(`${baseUrl}/wallets/send`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ from_agent_id: 'a', to_address: 'nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3', amount_xno: 1 }),
+      method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': 'paused-1' },
+      body: JSON.stringify({ from_agent_id: 'a', to_address: 'nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3', amount_raw: '1000' }),
     })
     const body = await r.json() as any
-    assert.equal(r.status, 500)
-    assert.match(String(body.error), /paused by the operator/)
+    // Day 268 lifecycle: the route reserves through wallet_ops, and the pause gate refuses first
+    // with 403 and a recorded denial. Before, the wallet service failed to construct (500).
+    assert.equal(r.status, 403)
+    assert.match(String(body.denial_reason), /paused by the operator/)
     const db = getDB()
     assert.equal((db.prepare(`SELECT spend_used FROM delegations WHERE id = 'd-a'`).get() as any).spend_used, 0)
-    assert.equal((db.prepare(`SELECT COUNT(*) n FROM wallet_transactions`).get() as any).n, 0)
+    assert.equal((db.prepare(`SELECT COUNT(*) n FROM wallet_ops`).get() as any).n, 0)
+    assert.equal((db.prepare(`SELECT COUNT(*) n FROM wallet_transactions WHERE status <> 'denied'`).get() as any).n, 0)
   })
 })
