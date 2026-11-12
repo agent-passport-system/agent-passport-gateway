@@ -5,7 +5,7 @@
 // gateway cannot reconcile. Agent sends, receives and settlement payouts all refuse before deriving
 // a key or calling a node, whatever the switches say, and the source has no Nano process call.
 // ══════════════════════════════════════════════════════════════════
-import { describe, it, before } from 'node:test'
+import { describe, it, before, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -40,6 +40,18 @@ before(() => {
   db.prepare(`INSERT INTO delegations (id, tenant_id, parent_agent_id, child_agent_id, scope, status, spend_limit, spend_used, spend_unit, spend_limit_minor, spend_used_minor) VALUES ('d-c', ?, 'root', 'c', 'commerce:send', 'active', 0, 0, 'nano:XNO:raw', ?, '0')`).run(TENANT, xnoToRaw('5'))
 })
 
+// Every relevant switch on and nothing paused, in every case below.
+beforeEach(() => {
+  process.env.NANO_WALLET_SEND_ENABLED = '1'
+  process.env.SETTLE_PAYOUT_ENABLED = 'true'
+  delete process.env.NANO_WALLETS_PAUSED
+  delete process.env.NANO_RAIL_DISABLED
+})
+afterEach(() => {
+  delete process.env.NANO_WALLET_SEND_ENABLED
+  delete process.env.SETTLE_PAYOUT_ENABLED
+})
+
 describe('the legacy publish path is closed', () => {
   it('sendNano and receiveNano refuse before calling anything', async () => {
     const s = await countingFetch(() => sendNano({ rpcUrl: 'http://node.invalid', seed: '0'.repeat(128), fromIndex: 1, toAddress: TO, amountRaw: '1' }))
@@ -49,32 +61,36 @@ describe('the legacy publish path is closed', () => {
     assert.equal(s.fetches + r.fetches, 0)
   })
 
-  it('an enabled, unpaused wallet send is refused at publishing, releases its debit, and calls no node', async () => {
-    process.env.NANO_WALLET_SEND_ENABLED = '1'
-    delete process.env.NANO_WALLETS_PAUSED
-    try {
-      const svc = new AgentWalletService({ localWallet: new NanoLocalWallet({ seed: '0'.repeat(128), rpcUrl: 'http://node.invalid' }) })
-      const out = await countingFetch(() => svc.send({ tenantId: TENANT, fromAgentId: 'c', toAddress: TO, amountRaw: xnoToRaw('1') }))
-      const tx = out.result as any
-      assert.equal(tx.status, 'failed')
-      assert.equal(tx.denial_reason, LEGACY_PUBLISH_CLOSED)
-      assert.equal(out.fetches, 0)
-      assert.equal((getDB().prepare(`SELECT spend_used_minor FROM delegations WHERE id = 'd-c'`).get() as any).spend_used_minor, '0')
-    } finally {
-      delete process.env.NANO_WALLET_SEND_ENABLED
-    }
+  it('an enabled, unpaused wallet send is refused at publishing, releases its debit once, and calls no node', async () => {
+    const svc = new AgentWalletService({ localWallet: new NanoLocalWallet({ seed: '0'.repeat(128), rpcUrl: 'http://node.invalid' }) })
+    const out = await countingFetch(() => svc.send({ tenantId: TENANT, fromAgentId: 'c', toAddress: TO, amountRaw: xnoToRaw('1') }))
+    const tx = out.result as any
+    assert.equal(tx.status, 'failed')
+    assert.equal(tx.denial_reason, LEGACY_PUBLISH_CLOSED)
+    assert.equal(out.fetches, 0)
+    // The debit came back exactly once: the counter is 0, not negative (applyUnitSpend refuses below 0).
+    assert.equal((getDB().prepare(`SELECT spend_used_minor FROM delegations WHERE id = 'd-c'`).get() as any).spend_used_minor, '0')
+    const rows = getDB().prepare(`SELECT status FROM wallet_transactions WHERE id = ?`).all(tx.id) as any[]
+    assert.deepEqual(rows.map(r => r.status), ['failed'])
+    // A second send behaves the same and the counter stays exact.
+    const again = await countingFetch(() => svc.send({ tenantId: TENANT, fromAgentId: 'c', toAddress: TO, amountRaw: xnoToRaw('2') }))
+    assert.equal((again.result as any).status, 'failed')
+    assert.equal(again.fetches, 0)
+    assert.equal((getDB().prepare(`SELECT spend_used_minor FROM delegations WHERE id = 'd-c'`).get() as any).spend_used_minor, '0')
+  })
+
+  it('an enabled receive through the wallet service refuses and calls no node', async () => {
+    const svc = new AgentWalletService({ localWallet: new NanoLocalWallet({ seed: '0'.repeat(128), rpcUrl: 'http://node.invalid' }) })
+    const out = await countingFetch(() => svc.receiveAll(TENANT, 'c'))
+    assert.ok(out.result instanceof Error && out.result.message === LEGACY_PUBLISH_CLOSED)
+    assert.equal(out.fetches, 0)
   })
 
   it('settlement payouts refuse before calling anything, with payouts enabled and nothing paused', async () => {
-    process.env.SETTLE_PAYOUT_ENABLED = 'true'
-    try {
-      const rail = new NanoPaymentRail({ rpcUrl: 'http://node.invalid', receivingAddress: TO } as any)
-      const out = await countingFetch(() => rail.sendPayment({ destination: TO, amount: 1 }))
-      assert.ok(out.result instanceof Error && out.result.message === SETTLEMENT_PAYOUT_CLOSED)
-      assert.equal(out.fetches, 0)
-    } finally {
-      delete process.env.SETTLE_PAYOUT_ENABLED
-    }
+    const rail = new NanoPaymentRail({ rpcUrl: 'http://node.invalid', receivingAddress: TO } as any)
+    const out = await countingFetch(() => rail.sendPayment({ destination: TO, amount: 1 }))
+    assert.ok(out.result instanceof Error && out.result.message === SETTLEMENT_PAYOUT_CLOSED)
+    assert.equal(out.fetches, 0)
   })
 
   it('the source has no Nano process call', () => {

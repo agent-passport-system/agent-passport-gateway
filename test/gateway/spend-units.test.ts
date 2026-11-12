@@ -258,10 +258,12 @@ describe('budget fields exposed publicly (trust profile and the signed governanc
     assert.equal(g.status, 201)
     const c = profileOf(a).active_constraints!
     assert.deepEqual([c.spend_unit, c.spend_limit_minor, c.spend_used_minor, c.spend_limit], [XNO, '7000000000000000000000000000000', '0', 0])
+    // The signed attestation cannot state a unit budget exactly, so it is refused, never sent with a
+    // zero REAL limit that would read as a zero budget.
     const att = attestationSpendConstraints(profileOf(a)._delegation_for_signal)
-    assert.deepEqual([att.spend_currency, att.spend_unit, att.spend_limit_minor, att.spend_limit], ['XNO', XNO, '7000000000000000000000000000000', 0])
+    assert.equal(att.ok, false)
   })
-  it('a legacy budget: a zero limit is reported as 0, not as no limit, and its currency as USD, not XNO', async () => {
+  it('a legacy budget: a zero limit is reported as 0, not as no limit, and no currency is asserted', async () => {
     const a = fresh('tp0')
     const g = await post('/delegations', { parent_agent_id: 'root', child_agent_id: a, scope: 'commerce:send', spend_limit: 25 })
     assert.equal(g.status, 201, JSON.stringify(g.body))
@@ -269,6 +271,14 @@ describe('budget fields exposed publicly (trust profile and the signed governanc
     const c = profileOf(a).active_constraints!
     assert.deepEqual([c.spend_limit, c.spend_unit], [0, null])
     const att = attestationSpendConstraints(profileOf(a)._delegation_for_signal)
-    assert.deepEqual([att.spend_currency, att.spend_limit, att.spend_unit], ['USD', 0, null])
+    assert.ok('constraints' in att)
+    assert.deepEqual(att.constraints, { scopes: ['commerce:send'], spend_limit: 0, spend_used: 0 })
+    // Only the properties governance-attestation draft v0.1 allows in active_constraints.
+    const allowed = ['scopes', 'spend_limit', 'spend_used', 'spend_currency', 'tool_restrictions', 'max_depth', 'current_depth', 'expires_at']
+    assert.deepEqual(Object.keys(att.constraints).filter(k => !allowed.includes(k)), [])
+    assert.ok(!('spend_currency' in att.constraints), 'a legacy row has no proven currency')
+    const none = attestationSpendConstraints(null)
+    assert.ok('constraints' in none)
+    assert.deepEqual(none.constraints, { scopes: [], spend_limit: null, spend_used: 0 })
   })
 })

@@ -1,18 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (unreleased)
 
-**Explicit spending units on delegations.** A grant can declare `spend_unit` (`iso4217:USD:minor` or `nano:XNO:raw`) with `spend_limit_minor`, a canonical decimal integer string in that unit's minor denomination. Units are checked when a grant narrows its parent: a unit grant under a legacy bounded parent, a legacy grant under a unit parent, a different unit, or a limit above the parent's remaining budget is refused. `spend_limit` cannot be combined with `spend_unit`. Grants without a unit behave as before.
+**BREAKING: Nano publishing is disabled.** Agent wallet sends, receives and settlement payouts now refuse to publish, even when their feature switches are enabled. These paths stop before deriving a private key or contacting a Nano node. If a send has already debited a delegation budget, the debit is reversed and the attempt is recorded as failed.
 
-**BREAKING: `POST /api/v1/wallets/send` takes an exact amount.** The body carries `amount_raw`, or `amount_xno` as an exact decimal string. A JSON number is refused, because it cannot carry 30 decimal places. The amount that is checked, debited and recorded is that one exact raw value. Every bounded delegation on the chain must be declared in `nano:XNO:raw`, and a legacy budget with no unit refuses the send, because the gateway does not convert between USD and XNO. The ancestor accounting and upgrade holds from 0.4.3 still apply.
+The previous opt-in send path had no durable payment record before publication. A crash or timeout could therefore leave a payment without a record the gateway could reconcile. Publishing remains disabled until a payment lifecycle with that record is available in the public gateway.
 
-**`/evaluate` under a unit budget.** `/evaluate` accounts spending only in the legacy columns, so under a unit-declared delegation it refuses an action that carries a positive cost and any `commerce` action.
+**Explicit spending units.** Delegations can now declare `spend_unit` as `iso4217:USD:minor` (cents) or `nano:XNO:raw`, with `spend_limit_minor` as a canonical decimal integer string. Amounts are calculated exactly, without currency conversion.
 
-**Reporting.** The trust profile and the signed governance attestation include the unit fields. A zero limit is reported as a zero budget, not as no limit. The attestation's currency comes from the unit, and is USD for legacy rows. Before, it said XNO for every row.
+A child cannot take a different spending unit from its parent, exceed its parent's remaining budget or receive an unlimited budget from a limited parent. A unit-declared child is refused under a legacy parent with a bounded budget, because that budget's unit is unknown. A legacy grant is also refused under a unit-declared parent.
 
-**BREAKING: Nano publishing is closed.** Agent wallet sends, receives and settlement payouts refuse before deriving a key or calling a node, whatever `NANO_WALLET_SEND_ENABLED` and `SETTLE_PAYOUT_ENABLED` say. A send that reaches publishing is recorded as `failed` and its debit is released. This release still writes no durable payment record before a block is broadcast, so a crash or timeout while publishing could leave a send the gateway cannot reconcile. Publishing stays closed until a payment lifecycle with that record is released. Explicit units do not make Nano sending ready on their own.
+`spend_limit` and `spend_unit` cannot be supplied together. Existing grants are not assigned a unit automatically.
 
-**Upgrading.** On startup the gateway adds the `spend_unit`, `spend_limit_minor` and `spend_used_minor` columns to `delegations` if they are missing, and refuses to start if one cannot be added. Existing rows keep `spend_unit` NULL and behave as legacy grants.
+**BREAKING: wallet send request amounts.** `POST /api/v1/wallets/send` now accepts `amount_raw` as an exact integer string or `amount_xno` as an exact decimal string. JSON numbers are refused, because they cannot represent every raw XNO amount.
+
+A send requires an XNO-denominated delegation, and every bounded ancestor must be declared in the same unit. Legacy budgets without a declared unit cannot authorize Nano spending. Publishing remains disabled regardless of these checks.
+
+**Evaluation and reporting.** For a unit-declared delegation, `/evaluate` denies requests with a positive estimated cost and any `commerce` action. In a shadow mode, `effective_verdict` may still be `permit`. That result is not authorization to execute a payment.
+
+The public trust profile now reports a delegation's declared unit and exact limit and usage, and a zero limit is reported as zero, not as unlimited. The signed governance attestation keeps the draft v0.1 schema:
+
+- For a legacy delegation it no longer asserts a currency. 0.4.3 and earlier labelled every budget XNO, although the counters of a legacy budget may hold USD or XNO amounts.
+- For a unit-declared delegation the attestation is refused with `422 attestation_unavailable`, because the v0.1 schema cannot state an exact unit budget.
+
+The FinOps delegation view still reads the legacy budget columns and does not show unit-declared limits.
+
+**Upgrading.** Startup adds `spend_unit`, `spend_limit_minor` and `spend_used_minor` to existing databases, and a failure to add a required column prevents startup. Existing delegation rows are not backfilled. Grants without a declared unit keep their legacy accounting, except that Nano sending is unavailable.
+
+Do not downgrade to an earlier version with the old Nano publishing path enabled.
 
 ## 0.4.3 (2026-11-11)
 

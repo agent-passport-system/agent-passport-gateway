@@ -115,6 +115,34 @@ after(async () => {
 })
 
 describe('POST /pay/nano/settle/:id - fail-closed authorization + currency gate', () => {
+  it('every switch on and the real rail: the payout route publishes nothing and records no confirmed payout', async () => {
+    const realFetch = globalThis.fetch
+    let fetches = 0
+    process.env.SETTLE_PAYOUT_ENABLED = 'true'
+    process.env.NANO_WALLET_SEND_ENABLED = '1'
+    delete process.env.NANO_WALLETS_PAUSED
+    try {
+      // Requests to this test server pass through. Any other fetch (a Nano node call) is counted and refused.
+      globalThis.fetch = (async (url: any, init: any) => {
+        if (String(url).startsWith(baseUrl)) return realFetch(url, init)
+        fetches++
+        throw new Error('no network in tests')
+      }) as any
+      const { status, body } = await settle({ 'src-xno': 'nano_1xno' })
+      const xno = body.results?.find((x: any) => x.source_id === 'src-xno')
+      assert.equal(status, 200)
+      assert.equal(xno?.status, 'failed')
+      assert.match(String(xno?.error), /settlement payouts are closed/)
+      assert.equal(fetches, 0)
+      const confirmed = getDB().prepare(`SELECT COUNT(*) AS c FROM payment_transactions WHERE settlement_id = ? AND status = 'confirmed'`).get(SETTLEMENT_ID) as any
+      assert.equal(confirmed.c, 0)
+    } finally {
+      globalThis.fetch = realFetch
+      delete process.env.SETTLE_PAYOUT_ENABLED
+      delete process.env.NANO_WALLET_SEND_ENABLED
+    }
+  })
+
   it('is disabled by default (SETTLE_PAYOUT_ENABLED unset): returns 503 and sends nothing', async (t) => {
     delete process.env.SETTLE_PAYOUT_ENABLED
     const send = t.mock.method(rail, 'sendPayment', async () => fakeConfirmation())

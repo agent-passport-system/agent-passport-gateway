@@ -255,22 +255,32 @@ export function buildAgentTrustProfile(opts: BuildTrustProfileOpts): TrustProfil
 
 /** Strip private underscore-prefixed fields before sending over the wire. */
 /**
- * The spend constraints carried in the signed governance_attestation claim. Day 268: the
- * currency comes from the declared unit. A legacy row's REAL limit is USD, which is how the grant
- * path has always stored it. Before this, every row was labelled 'XNO'.
+ * The spend constraints carried in the signed governance_attestation claim, shaped to the
+ * governance-attestation schema (draft v0.1, active_constraints: scopes, spend_limit, spend_used,
+ * optional spend_currency, no other properties).
+ *
+ * - A legacy row has no stored unit. Its REAL counters may hold USD from the grant path or XNO from
+ *   the old Nano send path, so no currency is asserted: spend_currency is omitted. 0.4.3 and earlier
+ *   labelled every row XNO.
+ * - A unit-declared row cannot be stated exactly in that schema: its exact budget is a decimal
+ *   string in minor units, and its REAL columns hold a zero sentinel that would read as a zero
+ *   budget. The attestation is refused for it until the schema carries units.
+ * - With no active delegation, the claim is empty scopes, no limit, nothing spent, as before.
  */
-export function attestationSpendConstraints(delegation: any) {
-  if (!delegation) {
-    return { scopes: [] as string[], spend_limit: null, spend_used: 0, spend_currency: null, spend_unit: null, spend_limit_minor: null, spend_used_minor: null }
+export function attestationSpendConstraints(delegation: any):
+  | { ok: true; constraints: { scopes: string[]; spend_limit: number | null; spend_used: number } }
+  | { ok: false; reason: string } {
+  if (!delegation) return { ok: true, constraints: { scopes: [], spend_limit: null, spend_used: 0 } }
+  if (delegation.spend_unit != null) {
+    return { ok: false, reason: `the delegation's budget is declared in ${delegation.spend_unit}, which governance_attestation draft v0.1 cannot state exactly` }
   }
   return {
-    scopes: delegation.scope ? String(delegation.scope).split(',').map((s: string) => s.trim()) : [],
-    spend_limit: delegation.spend_limit ?? null,
-    spend_used: delegation.spend_used ?? 0,
-    spend_currency: delegation.spend_unit === 'nano:XNO:raw' ? 'XNO' : 'USD',
-    spend_unit: delegation.spend_unit ?? null,
-    spend_limit_minor: delegation.spend_limit_minor ?? null,
-    spend_used_minor: delegation.spend_used_minor ?? null,
+    ok: true,
+    constraints: {
+      scopes: delegation.scope ? String(delegation.scope).split(',').map((s: string) => s.trim()) : [],
+      spend_limit: delegation.spend_limit ?? null,
+      spend_used: delegation.spend_used ?? 0,
+    },
   }
 }
 

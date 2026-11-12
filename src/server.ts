@@ -1224,7 +1224,9 @@ app.get('/api/v1/public/trust/:agentId', async (req, res) => {
     const evalTs = new Date().toISOString()
     const expTs = new Date(Date.now() + 5 * 60 * 1000).toISOString()
     const chainHash = computeDelegationChainHash(db, tenantId, agentId)
-    const activeConstraints = attestationSpendConstraints(delegation)
+    const spend = attestationSpendConstraints(delegation)
+    if ('reason' in spend) return res.status(422).json({ error: 'attestation_unavailable', message: spend.reason })
+    const activeConstraints = spend.constraints
 
     const claim = {
       signal_type: 'governance_attestation' as const,
