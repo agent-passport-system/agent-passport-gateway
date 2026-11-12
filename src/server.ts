@@ -68,6 +68,7 @@ import { initGatewayIdentity, getGatewayIdentity, getJwks } from './gateway/iden
 import { paymentRouter } from './payment-rails/routes.js'
 import { walletRouter } from './payment-rails/wallet-routes.js'
 import { assertNanoSeedProvisioned } from './payment-rails/wallet-crypto.js'
+import { computeDelegationChainHash } from './gateway/delegation-chain-hash.js'
 import { rekorRouter, initAnchorTable } from './gateway/rekor.js'
 import { finopsRouter } from './gateway/finops.js'
 import { CONFORMANCE_SUMMARY, conformanceBadge } from './gateway/conformance-summary.js'
@@ -1027,49 +1028,7 @@ function computeContinuityScore(db: any, tenantId: string, agentId: string, ageD
   return { score: Math.max(0, Math.min(100, score)), context_break: contextBreak, signals }
 }
 
-// Recursive canonical JSON stringifier — sorted object keys, arrays preserved.
-// Used to hash delegation chains deterministically for delegation_chain_hash.
-function canonicalJsonStringify(v: unknown): string {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v)
-  if (Array.isArray(v)) return '[' + v.map(canonicalJsonStringify).join(',') + ']'
-  const keys = Object.keys(v as Record<string, unknown>).sort()
-  return '{' + keys.map(k =>
-    JSON.stringify(k) + ':' + canonicalJsonStringify((v as Record<string, unknown>)[k])
-  ).join(',') + '}'
-}
-
-// Resolve the delegation chain root→current for an agent, then SHA-256
-// the canonicalized array. Returns lowercase hex. Empty chain → hash of "[]".
-function computeDelegationChainHash(
-  db: import('better-sqlite3').Database,
-  tenantId: string,
-  agentId: string,
-): string {
-  const chain: Array<{ parent: string; child: string; scope: string; spend_limit: number | null }> = []
-  let currentChild: string | null = agentId
-  const seen = new Set<string>()
-  // Walk root-ward: at each step the row where this agent is the child.
-  while (currentChild && !seen.has(currentChild)) {
-    seen.add(currentChild)
-    const row = db.prepare(
-      `SELECT parent_agent_id, child_agent_id, scope, spend_limit FROM delegations
-       WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
-       ORDER BY created_at DESC LIMIT 1`
-    ).get(tenantId, currentChild) as
-      | { parent_agent_id: string; child_agent_id: string; scope: string; spend_limit: number | null }
-      | undefined
-    if (!row) break
-    chain.push({
-      parent: row.parent_agent_id,
-      child: row.child_agent_id,
-      scope: row.scope,
-      spend_limit: row.spend_limit,
-    })
-    currentChild = row.parent_agent_id
-  }
-  chain.reverse() // root → current
-  return createHash('sha256').update(canonicalJsonStringify(chain)).digest('hex')
-}
+// delegation_chain_hash: see src/gateway/delegation-chain-hash.ts (one implementation for every surface).
 
 // Sign the public trust profile with the gateway's Ed25519 key and attach
 // the compact JWS as a response header. Body is unchanged, so callers that

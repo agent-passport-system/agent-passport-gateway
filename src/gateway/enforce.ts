@@ -15,6 +15,7 @@ import { Router } from 'express'
 import type Database from 'better-sqlite3'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import { randomUUID, createHash } from 'node:crypto'
+import { computeDelegationChainHash } from './delegation-chain-hash.js'
 // Receipt-ingest signature verification (audit item 6). Same SDK canonicalize/verify the
 // proxy-gateway already depends on; the ActionReceipt preimage is canonicalize(receipt minus
 // signature) verified against the signer's registered agents.public_key.
@@ -3037,30 +3038,11 @@ gatewayRouter.get('/audit-packet/:receiptId', (req: any, res) => {
   let delegationChainHash: string | null = null
   if (receipt.delegation_id) {
     try {
-      const chain: Array<{ parent: string; child: string; scope: string; spend_limit: number | null }> = []
       // Find the delegation to get the child agent
       const del = db.prepare(
-        `SELECT parent_agent_id, child_agent_id, scope, spend_limit FROM delegations WHERE id = ? AND tenant_id = ?`
+        `SELECT child_agent_id FROM delegations WHERE id = ? AND tenant_id = ?`
       ).get(receipt.delegation_id, tenant.id) as any
-      if (del) {
-        let currentChild: string | null = del.child_agent_id
-        const seen = new Set<string>()
-        while (currentChild && !seen.has(currentChild)) {
-          seen.add(currentChild)
-          const row = db.prepare(
-            `SELECT parent_agent_id, child_agent_id, scope, spend_limit FROM delegations
-             WHERE tenant_id = ? AND child_agent_id = ? AND status = 'active'
-             ORDER BY created_at DESC LIMIT 1`
-          ).get(tenant.id, currentChild) as any
-          if (!row) break
-          chain.push({ parent: row.parent_agent_id, child: row.child_agent_id, scope: row.scope, spend_limit: row.spend_limit })
-          currentChild = row.parent_agent_id
-        }
-        chain.reverse()
-        delegationChainHash = createHash('sha256')
-          .update(canonicalJsonStringify(chain))
-          .digest('hex')
-      }
+      if (del) delegationChainHash = computeDelegationChainHash(db, tenant.id, del.child_agent_id)
     } catch { notes.push('delegation_chain_hash_failed') }
   }
 
