@@ -180,10 +180,6 @@ async function generateWork(rpcUrl: string, hash: string): Promise<string> {
 // Send Nano — local signing, remote work + publish
 // ══════════════════════════════════════════════════════
 
-/** Day 268: a send that failed before the block was handed to the network. Nothing was
- *  published, so the caller may release what it reserved for this send. Any other error
- *  from sendNano happened during or after publishing, and the caller must treat the
- *  outcome as unknown: the block may still be accepted. */
 /**
  * The refusal both legacy publish paths raise before doing anything. This release has no durable
  * record of a payment before its block is broadcast, so a crash or timeout while publishing could
@@ -192,6 +188,10 @@ async function generateWork(rpcUrl: string, hash: string): Promise<string> {
  */
 export const LEGACY_PUBLISH_CLOSED = 'Nano publishing is closed in this release: nothing was signed or published'
 
+/** Day 268: a send that failed before the block was handed to the network. Nothing was
+ *  published, so the caller may release what it reserved for this send. Any other error
+ *  from sendNano happened during or after publishing, and the caller must treat the
+ *  outcome as unknown: the block may still be accepted. */
 export class NanoSendNotBroadcastError extends Error {
   constructor(message: string) {
     super(message)

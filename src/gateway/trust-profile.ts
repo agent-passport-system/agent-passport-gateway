@@ -209,7 +209,7 @@ export function buildAgentTrustProfile(opts: BuildTrustProfileOpts): TrustProfil
       // `?? null`, not `|| null`: a zero limit is a zero budget, never reported as no limit.
       spend_limit: delegation.spend_limit ?? null,
       spend_used: delegation.spend_used || 0,
-      // Day 268: a unit-declared budget, exactly. null on a legacy row, whose REAL limit is USD.
+      // Day 268: a unit-declared budget, exactly. null on a legacy row, whose REAL counters carry no proven unit.
       spend_unit: delegation.spend_unit ?? null,
       spend_limit_minor: delegation.spend_limit_minor ?? null,
       spend_used_minor: delegation.spend_used_minor ?? null,
@@ -253,7 +253,6 @@ export function buildAgentTrustProfile(opts: BuildTrustProfileOpts): TrustProfil
   return profile
 }
 
-/** Strip private underscore-prefixed fields before sending over the wire. */
 /**
  * The spend constraints carried in the signed governance_attestation claim, shaped to the
  * governance-attestation schema (draft v0.1, active_constraints: scopes, spend_limit, spend_used,
@@ -284,6 +283,7 @@ export function attestationSpendConstraints(delegation: any):
   }
 }
 
+/** Strip private underscore-prefixed fields before sending over the wire. */
 export function publicizeProfile(profile: TrustProfile): Record<string, any> {
   const out: Record<string, any> = {}
   for (const [k, v] of Object.entries(profile)) {
